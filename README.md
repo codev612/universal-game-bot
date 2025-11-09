@@ -72,6 +72,16 @@ Regions are saved to `layouts.json` and reloaded automatically for each game.
 
 When a game is selected, the layout designer automatically targets the device currently running it (or the first available device) when you capture screenshots.
 
+## Training Data Tab
+
+Use the **Training** tab to collect labeled screenshots for AI training:
+
+1. Select a game (and optionally adjust the dataset output directory).
+2. Ensure the game is running on at least one connected device; the tab automatically targets that device. Use **Capture Screenshot** for single frames, enable **Start Live Capture** to poll the device at a fixed interval, and click on the preview to send taps back to the emulator.
+3. Captured images are saved to `data/training/<game>/<timestamp>.png`, and the latest frame is shown in the preview pane.
+
+These samples can later be paired with annotations or actions for supervised or reinforcement learning workflows.
+
 ## Next steps
 
 - Capture device screenshots and pipe them through EasyOCR for on-screen recognition.

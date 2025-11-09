@@ -8,10 +8,12 @@ from PyQt6.QtGui import QPalette, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -25,6 +27,7 @@ from PyQt6.QtWidgets import (
 from core.device_manager import DeviceManager
 from core.layout_registry import LayoutRegistry, RegionConfig
 from gui.screenshot_canvas import Region, ScreenshotCanvas
+from gui.train_tab import TrainTab
 
 
 class Category:
@@ -43,6 +46,68 @@ class ControlMapping:
     notes: str = ""
 
 
+class _NameInputDialog(QDialog):
+    """Custom dialog that enforces unique, non-empty names."""
+
+    def __init__(
+        self,
+        title: str,
+        label: str,
+        existing_names: set[str],
+        default: str = "",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self._existing_names = existing_names
+
+        self._line_edit = QLineEdit(default)
+        self._line_edit.selectAll()
+        self._info_label = QLabel(label)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._info_label)
+        layout.addWidget(self._line_edit)
+        layout.addWidget(self._buttons)
+
+        self._line_edit.textChanged.connect(self._on_text_changed)
+        self._on_text_changed(self._line_edit.text())
+
+    def _on_text_changed(self, text: str) -> None:
+        trimmed = text.strip()
+        valid = bool(trimmed) and trimmed not in self._existing_names
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
+        if trimmed in self._existing_names:
+            self._info_label.setText("Name already exists. Choose a different name.")
+        else:
+            self._info_label.setText("Control name:")
+
+    @staticmethod
+    def get_name(
+        parent: QWidget,
+        title: str,
+        existing_names: set[str],
+        default: str = "",
+    ) -> Optional[str]:
+        dialog = _NameInputDialog(
+            title=title,
+            label="Control name:",
+            existing_names=existing_names,
+            default=default,
+            parent=parent,
+        )
+        result = dialog.exec()
+        if result == QDialog.DialogCode.Accepted:
+            return dialog._line_edit.text().strip()
+        return None
+
+
 class LayoutDesignerTab(QWidget):
     """Tab that allows configuring control positions on a screenshot."""
 
@@ -50,11 +115,13 @@ class LayoutDesignerTab(QWidget):
         self,
         device_manager: DeviceManager,
         layout_registry: LayoutRegistry,
+        train_tab: TrainTab,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._device_manager = device_manager
         self._layout_registry = layout_registry
+        self._train_tab = train_tab
         self._current_serial: Optional[str] = None
         self._current_game: Optional[str] = None
         self._controls_per_category: Dict[str, List[ControlMapping]] = {cat: [] for cat in Category.ALL}
@@ -145,6 +212,7 @@ class LayoutDesignerTab(QWidget):
         self._device_label.setText(display_name or "No device selected")
         self._update_status_for_context()
         self._update_buttons()
+        self._train_tab.set_active_device(serial, display_name)
 
     def _on_capture_clicked(self) -> None:
         if not self._current_serial:
@@ -184,12 +252,19 @@ class LayoutDesignerTab(QWidget):
         index = self._control_list.row(item)
         controls = self._controls_per_category[self.current_category]
         control = controls[index]
-        name, ok = QInputDialog.getText(self, "Rename Control", "Control name:", text=control.name)
-        if ok and name.strip():
-            control.name = name.strip()
+        existing = self._collect_existing_names(exclude=control.name)
+        name = _NameInputDialog.get_name(
+            parent=self,
+            title="Rename Control",
+            existing_names=existing,
+            default=control.name,
+        )
+        if name:
+            control.name = name
             item.setText(self._format_control_text(control))
             self._update_canvas_regions()
             self._persist_current_regions()
+            self._update_buttons()
 
     def _on_delete_clicked(self) -> None:
         item = self._control_list.currentItem()
@@ -210,12 +285,16 @@ class LayoutDesignerTab(QWidget):
     def _on_region_drawn(self, rect) -> None:
         if not self._pixmap:
             return
-        name, ok = QInputDialog.getText(self, "New Control", "Control name:")
-        if not ok or not name.strip():
+        name = _NameInputDialog.get_name(
+            parent=self,
+            title="New Control",
+            existing_names=self._collect_existing_names(),
+        )
+        if not name:
             self._status_label.setText("Region creation cancelled.")
             return
         control = ControlMapping(
-            name=name.strip(),
+            name=name,
             rect=(rect.x(), rect.y(), rect.width(), rect.height()),
             category=self.current_category,
         )
@@ -362,6 +441,14 @@ class LayoutDesignerTab(QWidget):
         else:
             self._layout_registry.clear_regions(target_game)
 
+    def _collect_existing_names(self, exclude: Optional[str] = None) -> set[str]:
+        names: set[str] = set()
+        for controls in self._controls_per_category.values():
+            for control in controls:
+                if control.name != exclude:
+                    names.add(control.name)
+        return names
+
     def set_active_game(self, game_name: Optional[str]) -> None:
         normalized = game_name or None
         if normalized == self._current_game:
@@ -376,5 +463,6 @@ class LayoutDesignerTab(QWidget):
         self._load_regions_for_game()
         self._update_buttons()
         self._update_status_for_context()
+        self._train_tab.set_active_game(self._current_game)
 
 

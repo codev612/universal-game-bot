@@ -1,1 +1,124 @@
-{}
+{
+  "Lineage2M": [
+    {
+      "name": "auto hunt",
+      "category": "Controls",
+      "x": 1530,
+      "y": 522,
+      "width": 62,
+      "height": 58
+    },
+    {
+      "name": "scan",
+      "category": "Controls",
+      "x": 1398,
+      "y": 520,
+      "width": 57,
+      "height": 62
+    },
+    {
+      "name": "hand",
+      "category": "Controls",
+      "x": 1659,
+      "y": 517,
+      "width": 69,
+      "height": 69
+    },
+    {
+      "name": "horse",
+      "category": "Controls",
+      "x": 1797,
+      "y": 520,
+      "width": 62,
+      "height": 66
+    },
+    {
+      "name": "fight",
+      "category": "Controls",
+      "x": 1502,
+      "y": 653,
+      "width": 124,
+      "height": 117
+    },
+    {
+      "name": "menu",
+      "category": "Controls",
+      "x": 1797,
+      "y": 23,
+      "width": 64,
+      "height": 52
+    },
+    {
+      "name": "mail",
+      "category": "Controls",
+      "x": 1707,
+      "y": 22,
+      "width": 51,
+      "height": 54
+    },
+    {
+      "name": "bag",
+      "category": "Controls",
+      "x": 1515,
+      "y": 21,
+      "width": 58,
+      "height": 48
+    },
+    {
+      "name": "shortcut",
+      "category": "Controls",
+      "x": 365,
+      "y": 125,
+      "width": 34,
+      "height": 43
+    },
+    {
+      "name": "merchant",
+      "category": "Controls",
+      "x": 359,
+      "y": 232,
+      "width": 43,
+      "height": 45
+    },
+    {
+      "name": "map",
+      "category": "Controls",
+      "x": 52,
+      "y": 119,
+      "width": 288,
+      "height": 184
+    },
+    {
+      "name": "mp board",
+      "category": "State Boards",
+      "x": 48,
+      "y": 18,
+      "width": 280,
+      "height": 31
+    },
+    {
+      "name": "red bottle",
+      "category": "State Boards",
+      "x": 604,
+      "y": 930,
+      "width": 69,
+      "height": 69
+    },
+    {
+      "name": "bag weight",
+      "category": "State Boards",
+      "x": 1514,
+      "y": 72,
+      "width": 58,
+      "height": 32
+    },
+    {
+      "name": "quests",
+      "category": "State Boards",
+      "x": 1319,
+      "y": 112,
+      "width": 463,
+      "height": 363
+    }
+  ]
+}

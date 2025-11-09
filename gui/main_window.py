@@ -32,6 +32,7 @@ from gui.add_device_dialog import AddDeviceDialog
 from gui.add_game_dialog import AddGameDialog
 from gui.device_table_model import DeviceTableModel
 from gui.layout_designer_tab import LayoutDesignerTab
+from gui.train_tab import TrainTab
 
 
 class MainWindow(QMainWindow):
@@ -74,12 +75,20 @@ class MainWindow(QMainWindow):
 
         self._tabs.addTab(self._devices_tab, "Devices")
 
-        self._layout_designer_tab = LayoutDesignerTab(
+        self._train_tab = TrainTab(
             device_manager=self._device_manager,
             layout_registry=self._layout_registry,
         )
+        self._train_tab.bind_signals()
+        self._tabs.addTab(self._train_tab, "Training")
+
+        self._layout_designer_tab = LayoutDesignerTab(
+            device_manager=self._device_manager,
+            layout_registry=self._layout_registry,
+            train_tab=self._train_tab,
+        )
         self._layout_designer_tab.bind_signals()
-        self._tabs.addTab(self._layout_designer_tab, "Control Layout")
+        self._tabs.insertTab(1, self._layout_designer_tab, "Control Layout")
 
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
@@ -90,6 +99,11 @@ class MainWindow(QMainWindow):
         self._update_layout_designer_device()
 
         self._device_manager.refresh_devices()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._train_tab.shutdown()
+        self._device_manager.shutdown()
+        super().closeEvent(event)
 
     def _build_header(self) -> QHBoxLayout:
         layout = QHBoxLayout()
@@ -209,6 +223,7 @@ class MainWindow(QMainWindow):
         self._open_shell_button.setEnabled(has_selection)
         self._update_check_button_state()
         self._update_layout_designer_device()
+        self._update_train_tab_device()
 
     def _on_devices_updated(self, devices) -> None:
         self._table_model.update_devices(devices)
@@ -235,6 +250,7 @@ class MainWindow(QMainWindow):
         self._remove_game_button.setEnabled(self._selected_game() is not None)
         game = self._selected_game()
         self._layout_designer_tab.set_active_game(game.name if game else None)
+        self._train_tab.set_active_game(game.name if game else None)
         self._update_layout_designer_device()
         if (
             not self._suppress_selection_checks
@@ -328,6 +344,7 @@ class MainWindow(QMainWindow):
         self._remove_game_button.setEnabled(self._selected_game() is not None)
         game = self._selected_game()
         self._layout_designer_tab.set_active_game(game.name if game else None)
+        self._train_tab.set_active_game(game.name if game else None)
 
     def _update_check_button_state(self) -> None:
         has_device = bool(self._device_manager.devices)
@@ -375,6 +392,7 @@ class MainWindow(QMainWindow):
             target_label = device.alias or device.display_name
 
         self._layout_designer_tab.set_active_device(target_serial, target_label)
+        self._train_tab.set_active_device(target_serial, target_label)
 
     def _check_selected_game(self) -> None:
         game = self._selected_game()

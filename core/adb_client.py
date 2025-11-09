@@ -189,6 +189,30 @@ class AdbClient:
         image.save(buffer, format="PNG")
         return buffer.getvalue()
 
+    def input_tap(self, serial: str, x: int, y: int) -> None:
+        """Send an input tap command to the specified device."""
+        device = self._get_device(serial)
+        try:
+            device.shell(f"input tap {int(x)} {int(y)}")
+        except adbutils.errors.AdbError as exc:
+            raise RuntimeError(f"Failed to send tap to '{serial}': {exc}") from exc
+
+    def input_swipe(
+        self,
+        serial: str,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        duration_ms: int = 300,
+    ) -> None:
+        """Send an input swipe command to the specified device."""
+        device = self._get_device(serial)
+        try:
+            device.shell(f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {max(0, int(duration_ms))}")
+        except adbutils.errors.AdbError as exc:
+            raise RuntimeError(f"Failed to send swipe to '{serial}': {exc}") from exc
+
     @staticmethod
     def _build_device_info(device: adbutils.AdbDevice) -> DeviceInfo:
         props = device.prop
