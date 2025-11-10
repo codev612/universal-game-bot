@@ -1,10 +1,14 @@
 [
   "Auto Moving",
   "Auto Questing",
-  "Boss Fight",
+  "Go to next questing",
+  "Going to gludin village",
   "Idle",
   "Loading",
-  "Purchasing",
+  "not available for auto",
+  "Purchasing blood",
   "Screen Locking",
-  "Teleporting"
+  "Teleporting",
+  "Unlock screen",
+  "Waiting for recharge blood"
 ]

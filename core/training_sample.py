@@ -18,6 +18,7 @@ class ActionRecord:
     start: Optional[Tuple[int, int]] = None
     end: Optional[Tuple[int, int]] = None
     duration_ms: Optional[int] = None
+    target_snippet: Optional[str] = None
 
 
 @dataclass(slots=True)

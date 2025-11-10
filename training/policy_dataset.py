@@ -22,7 +22,7 @@ class SampleEntry:
     player_state: Optional[str]
     state_board_values: Dict[str, str]
     action_type: ActionType
-    action_payload: Dict[str, Optional[Tuple[int, int]]]
+    action_payload: Dict[str, object]
 
 
 def _parse_numeric(value: str) -> float:
@@ -106,7 +106,7 @@ class PolicyDataset(Dataset):
                     player_state=payload.get("player_state"),
                     state_board_values=payload.get("state_board_values") or {},
                     action_type=action_type,  # type: ignore[assignment]
-                    action_payload=action,
+                action_payload=action,
                 )
                 self.entries.append(entry)
 
@@ -182,6 +182,7 @@ class PolicyDataset(Dataset):
             "image_size": (height, width),
             "game": entry.game,
             "player_state": entry.player_state,
+            "target_snippet": entry.action_payload.get("target_snippet") if isinstance(entry.action_payload, dict) else None,
         }
 
         return {

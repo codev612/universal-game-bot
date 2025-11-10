@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import io
-import re
 import json
+import math
+import re
 import shutil
 import sys
 from collections import defaultdict
@@ -42,15 +43,6 @@ DEFAULT_DETECTION_THRESHOLDS = {
     "orb": 0.80,
 }
 DEFAULT_COLOR_TOLERANCE = 35.0
-PLAYER_STATE_PRESETS = [
-    "Low blood",
-    "No moving",
-    "No progressing",
-    "Progressing",
-    "Heavy weight",
-]
-
-
 def _lazy_imports() -> None:
     global easyocr, Image, ImageEnhance, ImageFilter, ImageOps, torch
     if easyocr is None:
@@ -87,7 +79,9 @@ def _lazy_imports() -> None:
 from core.device_manager import DeviceManager
 from core.layout_registry import LayoutRegistry
 from core.scenario_registry import ScenarioRegistry
+from core.player_state_registry import PlayerStateRegistry
 from core.training_sample import ActionRecord, TrainingSample, TrainingSampleLogger
+from gui.player_state_dialog import PlayerStateDialog
 
 
 class ClickableLabel(QLabel):
@@ -146,6 +140,7 @@ class TrainTab(QWidget):
         device_manager: DeviceManager,
         layout_registry: LayoutRegistry,  # reserved for future use (e.g., auto-annotating regions)
         scenario_registry: ScenarioRegistry,
+        player_state_registry: PlayerStateRegistry,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -153,6 +148,7 @@ class TrainTab(QWidget):
         self._device_manager = device_manager
         self._layout_registry = layout_registry
         self._scenario_registry = scenario_registry
+        self._player_state_registry = player_state_registry
 
         self._current_serial: Optional[str] = None
         self._current_device_label = "No device selected"
@@ -160,10 +156,15 @@ class TrainTab(QWidget):
         self._current_scenario: Optional[str] = None
         self._next_scenario: Optional[str] = None
         self._scenario_history: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-        self._player_state_presets: List[str] = list(PLAYER_STATE_PRESETS)
+        self._player_state_presets: List[str] = list(self._player_state_registry.player_states())
         self._player_state_history: Dict[str, Optional[str]] = {}
         self._current_player_state: Optional[str] = None
         self._updating_player_state = False
+        self._current_action_target: Optional[str] = None
+        self._auto_target_guess: Optional[str] = None
+        self._updating_target_combo = False
+        self._last_detection_outcomes: Dict[str, bool] = {}
+        self._last_detection_scores: Dict[str, float] = {}
         self._available_scenarios: List[str] = []
         self._gpu_supported = bool(torch and torch.cuda.is_available())
         self._use_gpu = self._gpu_supported
@@ -211,6 +212,8 @@ class TrainTab(QWidget):
         self._reload_scenarios()
         self._restore_player_state()
         self._scenario_registry.scenarios_changed.connect(self._on_scenarios_changed)
+        self._player_state_registry.states_changed.connect(self._on_player_states_changed)
+        self._on_player_states_changed(self._player_state_registry.player_states())
         self._refresh_gpu_support()
         self._update_training_controls()
 
@@ -268,10 +271,18 @@ class TrainTab(QWidget):
 
         self._player_state_combo = QComboBox()
         self._player_state_combo.setEditable(True)
+        player_state_row_widget = QWidget()
+        player_state_row_layout = QHBoxLayout(player_state_row_widget)
+        player_state_row_layout.setContentsMargins(0, 0, 0, 0)
+        player_state_row_layout.setSpacing(6)
         self._player_state_combo.addItem("No player state")
         for option in self._player_state_presets:
             self._player_state_combo.addItem(option)
-        info_form.addRow("Player state:", self._player_state_combo)
+        self._manage_player_states_button = QPushButton("Manage…")
+        self._manage_player_states_button.clicked.connect(self._on_manage_player_states_clicked)
+        player_state_row_layout.addWidget(self._player_state_combo, stretch=1)
+        player_state_row_layout.addWidget(self._manage_player_states_button)
+        info_form.addRow("Player state:", player_state_row_widget)
 
         dataset_group = QGroupBox("Dataset")
         dataset_layout = QVBoxLayout(dataset_group)
@@ -340,6 +351,15 @@ class TrainTab(QWidget):
         self._detection_results_layout.setSpacing(6)
         detection_layout.addWidget(self._detection_results_widget)
         self._detection_results_widget.hide()
+        target_row = QHBoxLayout()
+        target_label = QLabel("Action target snippet:")
+        target_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._target_snippet_combo = QComboBox()
+        self._target_snippet_combo.setEditable(True)
+        target_row.addWidget(target_label)
+        target_row.addWidget(self._target_snippet_combo, stretch=1)
+        detection_layout.addLayout(target_row)
+        self._update_target_snippet_combo([])
 
         self._preview_group = QGroupBox("Last Capture Preview")
         preview_layout = QVBoxLayout(self._preview_group)
@@ -455,6 +475,7 @@ class TrainTab(QWidget):
         self._gpu_checkbox.toggled.connect(self._on_gpu_checkbox_changed)
         self._reset_dataset_button.clicked.connect(self._on_reset_dataset_clicked)
         self._player_state_combo.currentTextChanged.connect(self._on_player_state_changed)
+        self._target_snippet_combo.currentTextChanged.connect(self._on_target_snippet_changed)
 
     def bind_signals(self) -> None:
         """
@@ -757,6 +778,8 @@ class TrainTab(QWidget):
                 if match_info:
                     detection_scores[debug_name] = float(match_info.get("score", 0.0))
 
+        self._last_detection_outcomes = dict(detection_outcomes)
+        self._last_detection_scores = dict(detection_scores)
         self._update_detection_results(detection_outcomes, detection_scores)
 
         if summary_parts:
@@ -1123,9 +1146,17 @@ class TrainTab(QWidget):
             if widget:
                 widget.deleteLater()
 
+        names = list(outcomes.keys())
+        self._update_target_snippet_combo(names)
+
+        target_name = self._current_action_target
+        if not target_name:
+            target_name = self._auto_target_guess
+
         if not outcomes:
             self._detection_status_message.setText("No snippets processed yet.")
             self._detection_results_widget.hide()
+            self._auto_target_guess = None
             return
 
         self._detection_status_message.setText("Latest snippet detection results:")
@@ -1142,6 +1173,13 @@ class TrainTab(QWidget):
             result_label.setStyleSheet(
                 "color: #2e7d32;" if outcome else "color: #c62828;"
             )
+            if target_name and name == target_name:
+                result_label.setText(result_label.text() + " (target)")
+                result_label.setStyleSheet(
+                    "color: #1b5e20; font-weight: bold;"
+                    if outcome
+                    else "color: #b71c1c; font-weight: bold;"
+                )
             score = scores.get(name)
             if score is not None:
                 score_label = QLabel(f"Score: {score:.2f}")
@@ -1155,6 +1193,62 @@ class TrainTab(QWidget):
 
         self._detection_results_layout.addStretch(1)
         self._detection_results_widget.show()
+
+    def _update_target_snippet_combo(self, names: List[str]) -> None:
+        if not hasattr(self, "_target_snippet_combo"):
+            return
+        self._updating_target_combo = True
+        try:
+            current_manual = self._current_action_target
+            current_auto = self._auto_target_guess
+            current_text = self._target_snippet_combo.currentText().strip() if self._target_snippet_combo.count() else ""
+            self._target_snippet_combo.clear()
+            self._target_snippet_combo.addItem("Auto (nearest)")
+            seen = set()
+            for name in names:
+                if name and name not in seen:
+                    self._target_snippet_combo.addItem(name)
+                    seen.add(name)
+            if current_manual and current_manual in seen:
+                self._target_snippet_combo.setCurrentText(current_manual)
+            elif current_manual and current_manual not in seen:
+                self._current_action_target = None
+                if current_auto and current_auto in seen:
+                    self._target_snippet_combo.setCurrentText(current_auto)
+                else:
+                    self._target_snippet_combo.setCurrentIndex(0)
+            elif current_auto and current_auto in seen and not current_manual:
+                self._target_snippet_combo.setCurrentText(current_auto)
+            elif current_text and current_text not in {"", "Auto (nearest)"} and current_text in seen:
+                self._target_snippet_combo.setCurrentText(current_text)
+            else:
+                self._target_snippet_combo.setCurrentIndex(0)
+        finally:
+            self._updating_target_combo = False
+
+    def _refresh_detection_display(self) -> None:
+        self._update_detection_results(self._last_detection_outcomes, self._last_detection_scores)
+
+    def _set_auto_target_guess(self, name: Optional[str]) -> None:
+        if name and name not in self._last_detection_outcomes:
+            name = None
+        self._auto_target_guess = name
+        if self._current_action_target:
+            self._refresh_detection_display()
+            return
+        if hasattr(self, "_target_snippet_combo"):
+            self._updating_target_combo = True
+            try:
+                if name and self._target_snippet_combo.findText(name) != -1:
+                    self._target_snippet_combo.setCurrentText(name)
+                else:
+                    self._target_snippet_combo.setCurrentIndex(0)
+            finally:
+                self._updating_target_combo = False
+        self._refresh_detection_display()
+
+    def _snippet_name_detected(self, name: Optional[str]) -> bool:
+        return bool(name and name in self._last_detection_outcomes)
 
     def _update_capture_state(self) -> None:
         has_device = self._current_serial is not None
@@ -1273,6 +1367,35 @@ class TrainTab(QWidget):
     def _on_scenarios_changed(self, _: List[str]) -> None:
         self._reload_scenarios()
 
+    def _on_player_states_changed(self, states: List[str]) -> None:
+        self._player_state_presets = list(states)
+        current_selection = self._current_player_state
+        self._updating_player_state = True
+        self._player_state_combo.blockSignals(True)
+        try:
+            existing_text = self._player_state_combo.currentText().strip()
+            self._player_state_combo.clear()
+            self._player_state_combo.addItem("No player state")
+            for state in self._player_state_presets:
+                self._player_state_combo.addItem(state)
+            target = current_selection or existing_text
+            if target and target in self._player_state_presets:
+                index = self._player_state_combo.findText(target, Qt.MatchFlag.MatchExactly)
+                if index != -1:
+                    self._player_state_combo.setCurrentIndex(index)
+                    self._current_player_state = target
+                else:
+                    self._player_state_combo.setCurrentIndex(0)
+                    self._current_player_state = None
+            else:
+                self._player_state_combo.setCurrentIndex(0)
+                if current_selection:
+                    self._current_player_state = None
+        finally:
+            self._player_state_combo.blockSignals(False)
+            self._updating_player_state = False
+        self._store_player_state_history()
+
     def _on_player_state_changed(self, text: str) -> None:
         if self._updating_player_state:
             return
@@ -1281,16 +1404,31 @@ class TrainTab(QWidget):
             self._current_player_state = None
         else:
             if value not in self._player_state_presets:
-                self._player_state_presets.append(value)
-            if self._player_state_combo.findText(value) == -1:
-                self._player_state_combo.addItem(value)
+                self._player_state_registry.add_state(value)
             self._current_player_state = value
         self._store_player_state_history()
+
+    def _on_manage_player_states_clicked(self) -> None:
+        dialog = PlayerStateDialog(self._player_state_registry, self)
+        dialog.exec()
+
+    def _on_target_snippet_changed(self, text: str) -> None:
+        if self._updating_target_combo:
+            return
+        trimmed = text.strip()
+        if not trimmed or trimmed.lower() in {"auto (nearest)", "auto"}:
+            self._current_action_target = None
+        else:
+            self._current_action_target = trimmed
+            self._auto_target_guess = None
+        self._refresh_detection_display()
 
     def _log_training_sample(self, action: ActionRecord) -> None:
         if not self._last_screenshot_path:
             logger.warning("Skipping training sample; no screenshot has been captured yet.")
             return
+
+        self._annotate_action_with_snippet(action)
 
         sample = TrainingSample(
             screenshot_path=str(self._last_screenshot_path),
@@ -1315,6 +1453,62 @@ class TrainTab(QWidget):
 
     def _log_idle_sample(self) -> None:
         self._log_training_sample(ActionRecord(type="idle"))
+
+    def _annotate_action_with_snippet(self, action: ActionRecord) -> None:
+        if action.type not in {"tap", "swipe"}:
+            self._set_auto_target_guess(None)
+            action.target_snippet = None
+            return
+
+        manual_target = self._current_action_target
+        if manual_target and not self._snippet_name_detected(manual_target):
+            manual_target = None
+
+        if manual_target:
+            action.target_snippet = manual_target
+            self._set_auto_target_guess(None)
+            return
+
+        point: Optional[Tuple[int, int]] = None
+        if action.type == "tap":
+            point = action.position
+        elif action.type == "swipe":
+            point = action.start
+
+        guess = self._guess_snippet_from_point(point) if point else None
+        self._set_auto_target_guess(guess)
+        action.target_snippet = guess if self._snippet_name_detected(guess) else None
+
+    def _guess_snippet_from_point(
+        self,
+        point: Tuple[int, int],
+    ) -> Optional[str]:
+        if not self._snippet_matches:
+            return None
+        px, py = point
+        best_name = None
+        best_distance = float("inf")
+        for match in self._snippet_matches:
+            name = match.get("name")
+            x = int(match.get("x", 0))
+            y = int(match.get("y", 0))
+            w = int(match.get("w", 0))
+            h = int(match.get("h", 0))
+            if w <= 0 or h <= 0:
+                continue
+            within = (x <= px <= x + w) and (y <= py <= y + h)
+            if within:
+                distance = 0.0
+            else:
+                cx = min(max(px, x), x + w)
+                cy = min(max(py, y), y + h)
+                dx = px - cx
+                dy = py - cy
+                distance = math.hypot(dx, dy)
+            if distance < best_distance or (math.isclose(distance, best_distance) and name):
+                best_distance = distance
+                best_name = name
+        return best_name
 
     def _refresh_preview_display(self) -> None:
         if not self._last_raw_pixmap:
@@ -1608,16 +1802,26 @@ class TrainTab(QWidget):
 
     def _set_player_state(self, state: Optional[str]) -> None:
         self._updating_player_state = True
+        block_restored = False
         try:
-            if state and self._player_state_combo.findText(state) == -1:
-                self._player_state_combo.addItem(state)
+            if state and state not in self._player_state_presets:
+                self._player_state_registry.add_state(state)
+            self._player_state_combo.blockSignals(True)
             if state:
-                self._player_state_combo.setCurrentText(state)
+                index = self._player_state_combo.findText(state, Qt.MatchFlag.MatchExactly)
+                if index != -1:
+                    self._player_state_combo.setCurrentIndex(index)
+                else:
+                    self._player_state_combo.setCurrentIndex(0)
+                self._current_player_state = state if index != -1 else None
             else:
                 self._player_state_combo.setCurrentIndex(0)
-                self._player_state_combo.setCurrentText("No player state")
-            self._current_player_state = state
+                self._current_player_state = None
+            self._player_state_combo.blockSignals(False)
+            block_restored = True
         finally:
+            if not block_restored:
+                self._player_state_combo.blockSignals(False)
             self._updating_player_state = False
         self._store_player_state_history()
 
@@ -1937,9 +2141,6 @@ class TrainTab(QWidget):
         self._log_training_sample(ActionRecord(type="tap", position=(x, y)))
 
     def _on_preview_dragged(self, x1: int, y1: int, x2: int, y2: int) -> None:
-        if not self._current_serial:
-            QMessageBox.information(self, "Swipe", "Select a device before sending swipes.")
-            return
         if not self._last_raw_pixmap or not self._last_scaled_size:
             return
 
@@ -1950,6 +2151,20 @@ class TrainTab(QWidget):
 
         start_adj_x, start_adj_y, start_raw_x, start_raw_y = start_mapped
         end_adj_x, end_adj_y, end_raw_x, end_raw_y = end_mapped
+
+        if not self._current_serial:
+            self._status_label.setText(
+                "Swipe recorded locally (no device connected)."
+            )
+            self._log_training_sample(
+                ActionRecord(
+                    type="swipe",
+                    start=(start_raw_x, start_raw_y),
+                    end=(end_raw_x, end_raw_y),
+                    duration_ms=0,
+                )
+            )
+            return
 
         self._awaiting_swipe = True
         self._click_position_label.setText(

@@ -29,6 +29,7 @@ from core.device_manager import DeviceManager
 from core.game_registry import GameConfig, GameRegistry
 from core.layout_registry import LayoutRegistry
 from core.scenario_registry import ScenarioRegistry
+from core.player_state_registry import PlayerStateRegistry
 from gui.add_device_dialog import AddDeviceDialog
 from gui.add_game_dialog import AddGameDialog
 from gui.device_table_model import DeviceTableModel
@@ -46,6 +47,7 @@ class MainWindow(QMainWindow):
         game_registry: GameRegistry,
         layout_registry: LayoutRegistry,
         scenario_registry: ScenarioRegistry,
+        player_state_registry: PlayerStateRegistry,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -57,6 +59,7 @@ class MainWindow(QMainWindow):
         self._game_registry = game_registry
         self._layout_registry = layout_registry
         self._scenario_registry = scenario_registry
+        self._player_state_registry = player_state_registry
         self._pending_checks: Dict[Tuple[str, str], str] = {}
         self._auto_check_on_startup = True
         self._suppress_selection_checks = False
@@ -83,6 +86,7 @@ class MainWindow(QMainWindow):
             device_manager=self._device_manager,
             layout_registry=self._layout_registry,
             scenario_registry=self._scenario_registry,
+            player_state_registry=self._player_state_registry,
         )
         self._train_tab.bind_signals()
         self._layout_designer_tab = LayoutDesignerTab(
