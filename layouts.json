@@ -109,6 +109,33 @@
       "value_format": null
     },
     {
+      "name": "estimated weight",
+      "category": "Controls",
+      "x": 1237,
+      "y": 722,
+      "width": 36,
+      "height": 27,
+      "value_format": null
+    },
+    {
+      "name": "Health Potion",
+      "category": "Controls",
+      "x": 77,
+      "y": 278,
+      "width": 404,
+      "height": 80,
+      "value_format": null
+    },
+    {
+      "name": "close page",
+      "category": "Controls",
+      "x": 1804,
+      "y": 26,
+      "width": 62,
+      "height": 56,
+      "value_format": null
+    },
+    {
       "name": "mp board",
       "category": "State Boards",
       "x": 48,

@@ -28,10 +28,12 @@ from loguru import logger
 from core.device_manager import DeviceManager
 from core.game_registry import GameConfig, GameRegistry
 from core.layout_registry import LayoutRegistry
+from core.scenario_registry import ScenarioRegistry
 from gui.add_device_dialog import AddDeviceDialog
 from gui.add_game_dialog import AddGameDialog
 from gui.device_table_model import DeviceTableModel
 from gui.layout_designer_tab import LayoutDesignerTab
+from gui.scenario_tab import ScenarioTab
 from gui.train_tab import TrainTab
 
 
@@ -43,6 +45,7 @@ class MainWindow(QMainWindow):
         device_manager: DeviceManager,
         game_registry: GameRegistry,
         layout_registry: LayoutRegistry,
+        scenario_registry: ScenarioRegistry,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -53,6 +56,7 @@ class MainWindow(QMainWindow):
         self._table_model = DeviceTableModel()
         self._game_registry = game_registry
         self._layout_registry = layout_registry
+        self._scenario_registry = scenario_registry
         self._pending_checks: Dict[Tuple[str, str], str] = {}
         self._auto_check_on_startup = True
         self._suppress_selection_checks = False
@@ -78,17 +82,21 @@ class MainWindow(QMainWindow):
         self._train_tab = TrainTab(
             device_manager=self._device_manager,
             layout_registry=self._layout_registry,
+            scenario_registry=self._scenario_registry,
         )
         self._train_tab.bind_signals()
-        self._tabs.addTab(self._train_tab, "Training")
-
         self._layout_designer_tab = LayoutDesignerTab(
             device_manager=self._device_manager,
             layout_registry=self._layout_registry,
             train_tab=self._train_tab,
         )
         self._layout_designer_tab.bind_signals()
+        self._scenario_tab = ScenarioTab(self._scenario_registry)
+
         self._tabs.insertTab(1, self._layout_designer_tab, "Control Layout")
+        self._tabs.addTab(self._train_tab, "Training")
+        self._tabs.addTab(self._scenario_tab, "Scenarios")
+        self._train_tab.scenario_manage_requested.connect(self._show_scenario_tab)
 
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
@@ -104,6 +112,11 @@ class MainWindow(QMainWindow):
         self._train_tab.shutdown()
         self._device_manager.shutdown()
         super().closeEvent(event)
+
+    def _show_scenario_tab(self) -> None:
+        index = self._tabs.indexOf(self._scenario_tab)
+        if index != -1:
+            self._tabs.setCurrentIndex(index)
 
     def _build_header(self) -> QHBoxLayout:
         layout = QHBoxLayout()

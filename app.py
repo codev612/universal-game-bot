@@ -10,6 +10,7 @@ from loguru import logger
 from core.device_manager import DeviceManager
 from core.game_registry import GameRegistry
 from core.layout_registry import LayoutRegistry
+from core.scenario_registry import ScenarioRegistry
 from gui.main_window import MainWindow
 
 
@@ -37,10 +38,12 @@ def run(debug: bool = False, adb_path: Optional[str] = None) -> int:
     device_manager = DeviceManager(adb_path=adb_path)
     game_registry = GameRegistry(storage_path=Path("games.json"))
     layout_registry = LayoutRegistry(storage_path=Path("layouts.json"))
+    scenario_registry = ScenarioRegistry(storage_path=Path("scenarios.json"))
     window = MainWindow(
         device_manager=device_manager,
         game_registry=game_registry,
         layout_registry=layout_registry,
+        scenario_registry=scenario_registry,
     )
     window.show()
 

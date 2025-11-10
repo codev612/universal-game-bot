@@ -11,6 +11,7 @@ import numpy as np
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QMouseEvent, QPixmap
 from PyQt6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -42,6 +43,7 @@ except Exception as exc:  # noqa: BLE001
 
 from core.device_manager import DeviceManager
 from core.layout_registry import LayoutRegistry
+from core.scenario_registry import ScenarioRegistry
 
 
 class ClickableLabel(QLabel):
@@ -92,19 +94,28 @@ class TrainTab(QWidget):
     Screenshots are saved under the configured dataset directory, organized by game name.
     """
 
+    scenario_manage_requested = pyqtSignal()
+    _GLOBAL_SCENARIO_KEY = "__GLOBAL_SCENARIO__"
+
     def __init__(
         self,
         device_manager: DeviceManager,
         layout_registry: LayoutRegistry,  # reserved for future use (e.g., auto-annotating regions)
+        scenario_registry: ScenarioRegistry,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._device_manager = device_manager
         self._layout_registry = layout_registry
+        self._scenario_registry = scenario_registry
 
         self._current_serial: Optional[str] = None
         self._current_device_label = "No device selected"
         self._current_game: Optional[str] = None
+        self._current_scenario: Optional[str] = None
+        self._next_scenario: Optional[str] = None
+        self._scenario_history: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        self._available_scenarios: List[str] = []
 
         self._pending_capture: bool = False
         self._live_timer = QTimer(self)
@@ -121,6 +132,8 @@ class TrainTab(QWidget):
 
         self._build_ui()
         self._wire_signals()
+        self._reload_scenarios()
+        self._scenario_registry.scenarios_changed.connect(self._on_scenarios_changed)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -133,6 +146,46 @@ class TrainTab(QWidget):
 
         info_form.addRow("Device:", self._device_value)
         info_form.addRow("Game:", self._game_value)
+
+        scenario_row_widget = QWidget()
+        scenario_row_layout = QHBoxLayout(scenario_row_widget)
+        scenario_row_layout.setContentsMargins(0, 0, 0, 0)
+        scenario_row_layout.setSpacing(6)
+
+        scenario_labels = QVBoxLayout()
+        scenario_labels.setContentsMargins(0, 0, 0, 0)
+        scenario_labels.setSpacing(2)
+
+        current_label = QLabel("Current:")
+        next_label = QLabel("Next:")
+        current_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        next_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        scenario_labels.addWidget(current_label)
+        scenario_labels.addWidget(next_label)
+
+        scenario_combo_layout = QVBoxLayout()
+        scenario_combo_layout.setContentsMargins(0, 0, 0, 0)
+        scenario_combo_layout.setSpacing(2)
+
+        self._scenario_combo_current = QComboBox()
+        self._scenario_combo_current.addItem("No Scenario", None)
+        self._scenario_combo_current.setEnabled(False)
+
+        self._scenario_combo_next = QComboBox()
+        self._scenario_combo_next.addItem("No Scenario", None)
+        self._scenario_combo_next.setEnabled(False)
+
+        scenario_combo_layout.addWidget(self._scenario_combo_current)
+        scenario_combo_layout.addWidget(self._scenario_combo_next)
+
+        self._manage_scenarios_button = QPushButton("Manage…")
+        self._manage_scenarios_button.setEnabled(True)
+
+        scenario_row_layout.addLayout(scenario_labels)
+        scenario_row_layout.addLayout(scenario_combo_layout, stretch=1)
+        scenario_row_layout.addWidget(self._manage_scenarios_button)
+
+        info_form.addRow("Scenario:", scenario_row_widget)
 
         dataset_group = QGroupBox("Dataset")
         dataset_layout = QHBoxLayout(dataset_group)
@@ -218,6 +271,9 @@ class TrainTab(QWidget):
         self._device_manager.screenshot_captured.connect(self._on_screenshot_captured)
         self._device_manager.tap_sent.connect(self._on_tap_sent)
         self._device_manager.swipe_sent.connect(self._on_swipe_sent)
+        self._scenario_combo_current.currentIndexChanged.connect(self._on_current_scenario_changed)
+        self._scenario_combo_next.currentIndexChanged.connect(self._on_next_scenario_changed)
+        self._manage_scenarios_button.clicked.connect(self._on_manage_scenarios_clicked)
 
     def bind_signals(self) -> None:
         """
@@ -237,8 +293,13 @@ class TrainTab(QWidget):
         self._update_capture_state()
 
     def set_active_game(self, game_name: Optional[str]) -> None:
+        previous_game = self._current_game
+        if previous_game and previous_game != game_name:
+            self._scenario_history[previous_game] = (self._current_scenario, self._next_scenario)
+
         self._current_game = game_name
         self._game_value.setText(game_name or "No game selected")
+        self._reload_scenarios()
         self._update_capture_state()
         if self._last_screenshot_bytes:
             self._update_state_board_values(self._last_screenshot_bytes)
@@ -283,7 +344,10 @@ class TrainTab(QWidget):
 
         self._pending_capture = True
         self._capture_button.setEnabled(False)
-        self._status_label.setText(f"Capturing screenshot from {self._current_device_label}…")
+        game_label = self._current_game or "current game"
+        self._status_label.setText(
+            f"Capturing screenshot for {game_label}{self._scenario_suffix()} on {self._current_device_label}…"
+        )
         self._device_manager.capture_screenshot(self._current_serial)
 
     # Signal handlers ----------------------------------------------------------
@@ -295,16 +359,24 @@ class TrainTab(QWidget):
         self._pending_capture = False
         self._capture_button.setEnabled(True)
         if self._live_toggle.isChecked():
-            self._status_label.setText(f"Live capture active for {self._current_game}…")
+            self._status_label.setText(
+                f"Live capture active for {self._current_game}{self._scenario_suffix()}…"
+            )
 
         dataset_dir = self._dataset_directory(create=True)
         if dataset_dir is None:
             return
 
         timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        game_dir = dataset_dir / (self._current_game or "unknown_game")
+        game_name = self._current_game or "unknown_game"
+        game_dir = dataset_dir / game_name
         game_dir.mkdir(parents=True, exist_ok=True)
-        file_path = game_dir / f"{timestamp}.png"
+        target_dir = game_dir
+        scenario_dir = self._scenario_directory_name()
+        if scenario_dir:
+            target_dir = game_dir / scenario_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / f"{timestamp}{self._scenario_filename_suffix()}.png"
 
         try:
             file_path.write_bytes(data)
@@ -383,14 +455,138 @@ class TrainTab(QWidget):
             self._status_label.setText("Select a game in the Devices tab to begin data collection.")
         elif not has_device:
             self._status_label.setText(
-                f"{self._current_game} selected. Choose a device in the Devices tab to capture screenshots."
+                f"{self._current_game}{self._scenario_suffix()} selected. "
+                "Choose a device in the Devices tab to capture screenshots."
             )
         elif self._live_toggle.isChecked():
-            self._status_label.setText(f"Live capture active for {self._current_game} on {self._current_device_label}.")
+            self._status_label.setText(
+                f"Live capture active for {self._current_game}{self._scenario_suffix()} "
+                f"on {self._current_device_label}."
+            )
         else:
             self._status_label.setText(
-                f"Ready to capture screenshots for {self._current_game} on {self._current_device_label}."
+                f"Ready to capture screenshots for {self._current_game}{self._scenario_suffix()} "
+                f"on {self._current_device_label}."
             )
+
+    def _reload_scenarios(self) -> None:
+        if not hasattr(self, "_scenario_combo_current"):
+            return
+
+        self._scenario_combo_current.blockSignals(True)
+        self._scenario_combo_next.blockSignals(True)
+
+        for combo in (self._scenario_combo_current, self._scenario_combo_next):
+            combo.clear()
+            combo.addItem("No Scenario", None)
+
+        self._available_scenarios = self._scenario_registry.scenarios()
+        for scenario in self._available_scenarios:
+            self._scenario_combo_current.addItem(scenario, scenario)
+
+        history_key = self._current_game or self._GLOBAL_SCENARIO_KEY
+        stored_current, stored_next = self._scenario_history.get(history_key, (None, None))
+
+        if not self._select_scenario_in_combo(self._scenario_combo_current, stored_current):
+            self._scenario_combo_current.setCurrentIndex(0)
+            self._current_scenario = None
+        else:
+            self._current_scenario = stored_current
+
+        self._populate_next_combo(stored_next)
+
+        has_any = bool(self._available_scenarios)
+        self._scenario_combo_current.setEnabled(has_any)
+        self._scenario_combo_next.setEnabled(has_any and self._scenario_combo_next.count() > 1)
+
+        self._scenario_combo_current.blockSignals(False)
+        self._scenario_combo_next.blockSignals(False)
+        self._scenario_history[history_key] = (self._current_scenario, self._next_scenario)
+        self._update_capture_state()
+
+    def _select_scenario_in_combo(self, combo: QComboBox, scenario: Optional[str]) -> bool:
+        if not scenario:
+            return False
+        index = combo.findData(scenario)
+        if index == -1:
+            index = combo.findText(scenario)
+        if index == -1:
+            return False
+        combo.setCurrentIndex(index)
+        return True
+
+    def _populate_next_combo(self, desired: Optional[str]) -> None:
+        previous = desired if desired else self._next_scenario
+        self._scenario_combo_next.blockSignals(True)
+        self._scenario_combo_next.clear()
+        self._scenario_combo_next.addItem("No Scenario", None)
+        current = self._current_scenario
+        for scenario in self._available_scenarios:
+            if scenario == current:
+                continue
+            self._scenario_combo_next.addItem(scenario, scenario)
+
+        self._scenario_combo_next.setEnabled(self._scenario_combo_next.count() > 1)
+
+        if previous and self._select_scenario_in_combo(self._scenario_combo_next, previous):
+            self._next_scenario = previous
+        else:
+            self._scenario_combo_next.setCurrentIndex(0)
+            self._next_scenario = None
+        self._scenario_combo_next.blockSignals(False)
+
+    def _on_current_scenario_changed(self, index: int) -> None:
+        data = self._scenario_combo_current.itemData(index)
+        scenario = data if isinstance(data, str) and data.strip() else None
+        self._current_scenario = scenario
+        self._populate_next_combo(self._next_scenario)
+        self._store_scenario_history()
+        self._update_capture_state()
+
+    def _on_next_scenario_changed(self, index: int) -> None:
+        data = self._scenario_combo_next.itemData(index)
+        scenario = data if isinstance(data, str) and data.strip() else None
+        self._next_scenario = scenario
+        self._store_scenario_history()
+        self._update_capture_state()
+
+    def _on_manage_scenarios_clicked(self) -> None:
+        self.scenario_manage_requested.emit()
+
+    def _on_scenarios_changed(self, _: List[str]) -> None:
+        self._reload_scenarios()
+
+    def _scenario_suffix(self) -> str:
+        if self._current_scenario and self._next_scenario:
+            return f" (Scenario: {self._current_scenario} → {self._next_scenario})"
+        if self._current_scenario:
+            return f" (Scenario: {self._current_scenario})"
+        if self._next_scenario:
+            return f" (Next Scenario: {self._next_scenario})"
+        return ""
+
+    def _scenario_directory_name(self) -> Optional[str]:
+        if not self._current_scenario:
+            return None
+        slug = self._scenario_slug(self._current_scenario)
+        return slug or None
+
+    def _scenario_filename_suffix(self) -> str:
+        parts = []
+        if self._current_scenario:
+            parts.append(f"curr-{self._scenario_slug(self._current_scenario)}")
+        if self._next_scenario:
+            parts.append(f"next-{self._scenario_slug(self._next_scenario)}")
+        return ("__" + "__".join(parts)) if parts else ""
+
+    @staticmethod
+    def _scenario_slug(name: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+        return slug or "unspecified"
+
+    def _store_scenario_history(self) -> None:
+        key = self._current_game or self._GLOBAL_SCENARIO_KEY
+        self._scenario_history[key] = (self._current_scenario, self._next_scenario)
 
     def _on_live_toggled(self, checked: bool) -> None:
         if checked:
@@ -439,7 +635,10 @@ class TrainTab(QWidget):
         self._live_toggle.setText("Stop Live Capture")
         self._capture_button.setEnabled(False)
         self._pending_capture = False
-        self._status_label.setText(f"Live capture active for {self._current_game} on {self._current_device_label}.")
+        self._status_label.setText(
+            f"Live capture active for {self._current_game}{self._scenario_suffix()} "
+            f"on {self._current_device_label}."
+        )
         self._trigger_live_capture()
 
     def _stop_live_capture(self) -> None:
@@ -450,7 +649,8 @@ class TrainTab(QWidget):
         self._capture_button.setEnabled(self._current_serial is not None and self._current_game is not None)
         if self._current_game and self._current_serial:
             self._status_label.setText(
-                f"Live capture stopped. Ready for manual capture on {self._current_device_label}."
+                f"Live capture stopped for {self._current_game}{self._scenario_suffix()}. "
+                f"Ready for manual capture on {self._current_device_label}."
             )
         else:
             self._status_label.setText("Select a game and device to begin data collection.")
@@ -733,7 +933,7 @@ class TrainTab(QWidget):
             correct_prompt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
             input_edit = QLineEdit(previous_inputs.get(name, ""))
-            input_edit.setPlaceholderText("Enter correct value")
+            input_edit.setPlaceholderText("Leave blank if captured value is correct")
 
             row_layout.addWidget(name_label)
             row_layout.addWidget(captured_label, stretch=1)
@@ -744,6 +944,17 @@ class TrainTab(QWidget):
             self._state_board_inputs[name] = input_edit
 
         self._state_board_results_layout.addStretch(1)
+
+    def get_state_board_values(self) -> Dict[str, str]:
+        collected: Dict[str, str] = {}
+        for name, captured_values in self._state_board_captured.items():
+            override_widget = self._state_board_inputs.get(name)
+            override_value = override_widget.text().strip() if override_widget else ""
+            if override_value:
+                collected[name] = override_value
+            else:
+                collected[name] = ", ".join(captured_values)
+        return collected
 
     def _get_ocr_reader(self) -> Optional["easyocr.Reader"]:
         if easyocr is None:
