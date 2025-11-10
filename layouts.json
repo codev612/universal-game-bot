@@ -109,15 +109,6 @@
       "value_format": null
     },
     {
-      "name": "estimated weight",
-      "category": "Controls",
-      "x": 1237,
-      "y": 722,
-      "width": 36,
-      "height": 27,
-      "value_format": null
-    },
-    {
       "name": "Health Potion",
       "category": "Controls",
       "x": 77,
@@ -143,24 +134,6 @@
       "width": 280,
       "height": 31,
       "value_format": "xxxx/yyyy"
-    },
-    {
-      "name": "red bottle",
-      "category": "State Boards",
-      "x": 604,
-      "y": 930,
-      "width": 69,
-      "height": 69,
-      "value_format": null
-    },
-    {
-      "name": "bag weight",
-      "category": "State Boards",
-      "x": 1514,
-      "y": 72,
-      "width": 58,
-      "height": 32,
-      "value_format": "xx%"
     },
     {
       "name": "first quest",
@@ -197,6 +170,24 @@
       "width": 119,
       "height": 63,
       "value_format": null
+    },
+    {
+      "name": "estimated weight",
+      "category": "State Boards",
+      "x": 1239,
+      "y": 721,
+      "width": 33,
+      "height": 31,
+      "value_format": null
+    },
+    {
+      "name": "bag weight",
+      "category": "State Boards",
+      "x": 1518,
+      "y": 76,
+      "width": 28,
+      "height": 26,
+      "value_format": "xxxx"
     }
   ]
 }

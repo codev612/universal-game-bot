@@ -5,6 +5,7 @@ from .device_manager import DeviceManager
 from .game_registry import GameConfig, GameRegistry
 from .layout_registry import LayoutRegistry, RegionConfig
 from .scenario_registry import ScenarioRegistry
+from .training_sample import ActionRecord, TrainingSample, TrainingSampleLogger
 
 __all__ = [
     "AdbClient",
@@ -15,5 +16,8 @@ __all__ = [
     "LayoutRegistry",
     "RegionConfig",
     "ScenarioRegistry",
+    "ActionRecord",
+    "TrainingSample",
+    "TrainingSampleLogger",
 ]
 

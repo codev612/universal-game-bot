@@ -104,11 +104,12 @@ class AdbClient:
             The serial identifier returned by the ADB server (typically host:port).
         """
         self.ensure_server()
+        target = f"{host}:{port}"
         try:
-            device = self._client.connect(host=host, port=port)
+            result = self._client.connect(target)
         except adbutils.errors.AdbError as exc:
             raise RuntimeError(f"ADB connect failed: {exc}") from exc
-        return device.serial
+        return getattr(result, "serial", target)
 
     def _get_device(self, serial: str) -> adbutils.AdbDevice:
         self.ensure_server()

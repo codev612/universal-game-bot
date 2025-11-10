@@ -3,14 +3,17 @@ from __future__ import annotations
 import datetime as dt
 import io
 import re
+import shutil
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QProcess, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QMouseEvent, QPixmap
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -26,24 +29,38 @@ from PyQt6.QtWidgets import (
 )
 from loguru import logger
 
-try:
-    import easyocr
-except Exception as exc:  # noqa: BLE001
-    easyocr = None  # type: ignore[assignment]
-    logger.warning("EasyOCR not available: {}", exc)
+easyocr = None
+Image = ImageEnhance = ImageFilter = ImageOps = None
+torch = None
 
-try:
-    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-except Exception as exc:  # noqa: BLE001
-    Image = None  # type: ignore[assignment]
-    ImageEnhance = None  # type: ignore[assignment]
-    ImageFilter = None  # type: ignore[assignment]
-    ImageOps = None  # type: ignore[assignment]
-    logger.warning("Pillow not available: {}", exc)
+def _lazy_imports() -> None:
+    global easyocr, Image, ImageEnhance, ImageFilter, ImageOps, torch
+    if easyocr is None:
+        try:
+            import easyocr  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001
+            easyocr = None  # type: ignore[assignment]
+            logger.warning("EasyOCR not available: {}", exc)
+    if Image is None:
+        try:
+            from PIL import Image, ImageEnhance, ImageFilter, ImageOps  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001
+            Image = None  # type: ignore[assignment]
+            ImageEnhance = None  # type: ignore[assignment]
+            ImageFilter = None  # type: ignore[assignment]
+            ImageOps = None  # type: ignore[assignment]
+            logger.warning("Pillow not available: {}", exc)
+    if torch is None:
+        try:
+            import torch  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001
+            torch = None
+            logger.warning("PyTorch not available: {}", exc)
 
 from core.device_manager import DeviceManager
 from core.layout_registry import LayoutRegistry
 from core.scenario_registry import ScenarioRegistry
+from core.training_sample import ActionRecord, TrainingSample, TrainingSampleLogger
 
 
 class ClickableLabel(QLabel):
@@ -105,6 +122,7 @@ class TrainTab(QWidget):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
+        _lazy_imports()
         self._device_manager = device_manager
         self._layout_registry = layout_registry
         self._scenario_registry = scenario_registry
@@ -116,6 +134,8 @@ class TrainTab(QWidget):
         self._next_scenario: Optional[str] = None
         self._scenario_history: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
         self._available_scenarios: List[str] = []
+        self._gpu_supported = bool(torch and torch.cuda.is_available())
+        self._use_gpu = self._gpu_supported
 
         self._pending_capture: bool = False
         self._live_timer = QTimer(self)
@@ -129,11 +149,16 @@ class TrainTab(QWidget):
         self._ocr_enabled: bool = True
         self._state_board_inputs: Dict[str, QLineEdit] = {}
         self._state_board_captured: Dict[str, List[str]] = {}
+        self._sample_logger = TrainingSampleLogger(Path("data/training/training_samples.jsonl"))
+        self._last_screenshot_path: Optional[Path] = None
+        self._training_process: Optional[QProcess] = None
 
         self._build_ui()
         self._wire_signals()
         self._reload_scenarios()
         self._scenario_registry.scenarios_changed.connect(self._on_scenarios_changed)
+        self._refresh_gpu_support()
+        self._update_training_controls()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -188,15 +213,20 @@ class TrainTab(QWidget):
         info_form.addRow("Scenario:", scenario_row_widget)
 
         dataset_group = QGroupBox("Dataset")
-        dataset_layout = QHBoxLayout(dataset_group)
+        dataset_layout = QVBoxLayout(dataset_group)
 
+        dataset_row = QHBoxLayout()
         self._dataset_path_edit = QLineEdit(str(Path("data") / "training").replace("\\", "/"))
         self._dataset_path_edit.setPlaceholderText("Directory to store captured screenshots")
         browse_button = QPushButton("Browse…")
         browse_button.clicked.connect(self._on_browse_dataset)
+        dataset_row.addWidget(self._dataset_path_edit, stretch=1)
+        dataset_row.addWidget(browse_button)
 
-        dataset_layout.addWidget(self._dataset_path_edit, stretch=1)
-        dataset_layout.addWidget(browse_button)
+        self._reset_dataset_button = QPushButton("Reset Dataset")
+
+        dataset_layout.addLayout(dataset_row)
+        dataset_layout.addWidget(self._reset_dataset_button)
 
         action_row = QHBoxLayout()
         self._capture_button = QPushButton("Capture Screenshot")
@@ -225,10 +255,16 @@ class TrainTab(QWidget):
         action_row.addLayout(interval_box)
         action_row.addStretch(1)
 
-        layout.addWidget(info_group)
-        layout.addWidget(dataset_group)
-        layout.addLayout(action_row)
-        layout.addWidget(self._status_label)
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(12)
+        header_row = QHBoxLayout()
+        header_row.addWidget(info_group, stretch=1)
+        header_row.addWidget(dataset_group, stretch=1)
+        content_layout.addLayout(header_row)
+        content_layout.addLayout(action_row)
+        content_layout.addWidget(self._status_label)
 
         self._preview_group = QGroupBox("Last Capture Preview")
         preview_layout = QVBoxLayout(self._preview_group)
@@ -238,17 +274,17 @@ class TrainTab(QWidget):
         self._preview_label.clicked.connect(self._on_preview_clicked)
         self._preview_label.dragged.connect(self._on_preview_dragged)
 
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setMinimumSize(720, 440)
-        scroll_area.setWidget(self._preview_label)
+        self._preview_scroll = QScrollArea()
+        self._preview_scroll.setWidgetResizable(True)
+        self._preview_scroll.setMinimumSize(720, 440)
+        self._preview_scroll.setWidget(self._preview_label)
+        self._preview_scroll.viewport().installEventFilter(self)
 
         self._click_position_label = QLabel("Click on the preview to send a tap. Coordinates will appear here.")
         self._click_position_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        preview_layout.addWidget(scroll_area)
+        preview_layout.addWidget(self._preview_scroll)
         preview_layout.addWidget(self._click_position_label)
-        layout.addWidget(self._preview_group, stretch=1)
 
         self._ocr_results_group = QGroupBox("State Board Values")
         ocr_layout = QVBoxLayout(self._ocr_results_group)
@@ -264,7 +300,50 @@ class TrainTab(QWidget):
         self._state_board_results_layout.setSpacing(8)
         ocr_layout.addWidget(self._state_board_results_widget)
         self._state_board_results_widget.hide()
-        layout.addWidget(self._ocr_results_group)
+
+        self._training_group = QGroupBox("AI Training")
+        training_layout = QVBoxLayout(self._training_group)
+
+        self._gpu_info_label = QLabel("")
+        self._gpu_info_label.setStyleSheet("color: #666666; font-size: 11px;")
+        training_layout.addWidget(self._gpu_info_label)
+
+        self._gpu_checkbox = QCheckBox("Use GPU")
+        self._gpu_checkbox.setChecked(self._use_gpu)
+        if not self._gpu_supported:
+            self._gpu_checkbox.setEnabled(False)
+            self._gpu_checkbox.setToolTip("CUDA GPU not detected in this environment.")
+        training_layout.addWidget(self._gpu_checkbox)
+
+        training_row = QVBoxLayout()
+        self._start_training_button = QPushButton("Start Training")
+        self._stop_training_button = QPushButton("Stop Training")
+        self._stop_training_button.setEnabled(False)
+        training_row.addWidget(self._start_training_button)
+        training_row.addWidget(self._stop_training_button)
+        training_layout.addLayout(training_row)
+
+        self._training_status_label = QLabel("Training idle.")
+        self._training_status_label.setWordWrap(True)
+        training_layout.addWidget(self._training_status_label)
+
+        note_label = QLabel(
+            "Runs training/train_policy.py with collected samples. Ensure training_samples.jsonl exists."
+        )
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet("color: #666666; font-size: 11px;")
+        training_layout.addWidget(note_label)
+
+        panels_row = QHBoxLayout()
+        panels_row.addWidget(self._ocr_results_group, stretch=1)
+        panels_row.addWidget(self._preview_group, stretch=2)
+        panels_row.addWidget(self._training_group, stretch=1)
+        content_layout.addLayout(panels_row)
+
+        outer_scroll = QScrollArea()
+        outer_scroll.setWidgetResizable(True)
+        outer_scroll.setWidget(content_widget)
+        layout.addWidget(outer_scroll, stretch=1)
 
     def _wire_signals(self) -> None:
         self._device_manager.error_occurred.connect(self._on_error)
@@ -274,6 +353,11 @@ class TrainTab(QWidget):
         self._scenario_combo_current.currentIndexChanged.connect(self._on_current_scenario_changed)
         self._scenario_combo_next.currentIndexChanged.connect(self._on_next_scenario_changed)
         self._manage_scenarios_button.clicked.connect(self._on_manage_scenarios_clicked)
+        self._start_training_button.clicked.connect(self._on_start_training_clicked)
+        self._stop_training_button.clicked.connect(self._on_stop_training_clicked)
+        self._gpu_checkbox.toggled.connect(self._on_gpu_checkbox_changed)
+        self._reset_dataset_button.clicked.connect(self._on_reset_dataset_clicked)
+        self._reset_dataset_button.clicked.connect(self._on_reset_dataset_clicked)
 
     def bind_signals(self) -> None:
         """
@@ -294,8 +378,9 @@ class TrainTab(QWidget):
 
     def set_active_game(self, game_name: Optional[str]) -> None:
         previous_game = self._current_game
-        if previous_game and previous_game != game_name:
-            self._scenario_history[previous_game] = (self._current_scenario, self._next_scenario)
+        if previous_game != game_name:
+            key = previous_game or self._GLOBAL_SCENARIO_KEY
+            self._scenario_history[key] = (self._current_scenario, self._next_scenario)
 
         self._current_game = game_name
         self._game_value.setText(game_name or "No game selected")
@@ -385,19 +470,12 @@ class TrainTab(QWidget):
             QMessageBox.critical(self, "Capture Error", f"Failed to save screenshot:\n{exc}")
             return
 
+        self._last_screenshot_path = file_path
         self._last_screenshot_bytes = bytes(data)
         pixmap = QPixmap()
         if pixmap.loadFromData(data, "PNG"):
             self._last_raw_pixmap = pixmap
-            scaled = pixmap.scaled(
-                960,
-                540,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self._last_scaled_size = (scaled.width(), scaled.height())
-            self._preview_label.setPixmap(scaled)
-            self._preview_label.resize(scaled.size())
+            self._refresh_preview_display()
         else:
             self._preview_label.setText("Unable to load preview image.")
             self._last_raw_pixmap = None
@@ -407,6 +485,7 @@ class TrainTab(QWidget):
         self._click_position_label.setText("Click on the preview to send a tap. Coordinates will appear here.")
         logger.info("Training screenshot saved to {}", file_path)
         self._update_state_board_values(data)
+        self._log_idle_sample()
 
     def _on_error(self, message: str) -> None:
         if self._pending_capture:
@@ -444,11 +523,13 @@ class TrainTab(QWidget):
     def _update_capture_state(self) -> None:
         has_device = self._current_serial is not None
         has_game = self._current_game is not None
-        can_capture = has_device and has_game and not self._pending_capture
-        self._capture_button.setEnabled(can_capture and not self._live_toggle.isChecked())
-        self._live_toggle.setEnabled(has_device and has_game)
+        ready_for_capture = has_device and has_game
+        can_capture = ready_for_capture and not self._pending_capture
 
-        if self._live_toggle.isChecked() and not can_capture:
+        self._capture_button.setEnabled(can_capture and not self._live_toggle.isChecked())
+        self._live_toggle.setEnabled(ready_for_capture)
+
+        if self._live_toggle.isChecked() and not ready_for_capture:
             self._stop_live_capture()
 
         if not has_game:
@@ -555,6 +636,255 @@ class TrainTab(QWidget):
 
     def _on_scenarios_changed(self, _: List[str]) -> None:
         self._reload_scenarios()
+
+    def _log_training_sample(self, action: ActionRecord) -> None:
+        if not self._last_screenshot_path:
+            logger.warning("Skipping training sample; no screenshot has been captured yet.")
+            return
+
+        sample = TrainingSample(
+            screenshot_path=str(self._last_screenshot_path),
+            game=self._current_game,
+            scenario_current=self._current_scenario,
+            scenario_next=self._next_scenario,
+            state_board_values=self.get_state_board_values(),
+            action=action,
+            timestamp=TrainingSample.timestamp_now(),
+        )
+        self._sample_logger.append(sample)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if (
+            hasattr(self, "_preview_scroll")
+            and obj is self._preview_scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._refresh_preview_display()
+        return super().eventFilter(obj, event)
+
+    def _log_idle_sample(self) -> None:
+        self._log_training_sample(ActionRecord(type="idle"))
+
+    def _refresh_preview_display(self) -> None:
+        if not self._last_raw_pixmap:
+            return
+        target_size = self._preview_scroll.viewport().size()
+        target_width = max(1, target_size.width())
+        target_height = max(1, target_size.height())
+        if target_width == 1 and target_height == 1:
+            target_width, target_height = 960, 540
+        scaled = self._last_raw_pixmap.scaled(
+            target_width,
+            target_height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._last_scaled_size = (scaled.width(), scaled.height())
+        self._preview_label.setPixmap(scaled)
+        self._preview_label.resize(scaled.size())
+
+    def _refresh_gpu_support(self) -> None:
+        _lazy_imports()
+        info_parts: List[str] = []
+        available = False
+
+        if torch is None:
+            info_parts.append("PyTorch not installed")
+        else:
+            try:
+                available = torch.cuda.is_available()
+                info_parts.append(f"PyTorch {torch.__version__}")
+                info_parts.append(f"CUDA available: {available}")
+                info_parts.append(f"Python: {sys.executable}")
+                cuda_version = getattr(torch.version, "cuda", None)
+                if cuda_version:
+                    info_parts.append(f"CUDA build: {cuda_version}")
+                if available:
+                    try:
+                        info_parts.append(f"Device: {torch.cuda.get_device_name(0)}")
+                    except Exception as exc:  # noqa: BLE001
+                        info_parts.append(f"Device query failed: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                info_parts.append(f"cuda detection error: {exc}")
+
+        self._gpu_supported = available
+        display_text = "\n".join(info_parts) if info_parts else "No GPU information available."
+        self._gpu_info_label.setText(display_text)
+
+        self._gpu_checkbox.setToolTip(
+            "CUDA GPU detected." if available else "CUDA GPU not detected in this environment."
+        )
+        self._gpu_checkbox.setEnabled(available)
+        if available:
+            self._gpu_checkbox.blockSignals(True)
+            self._gpu_checkbox.setChecked(self._use_gpu)
+            self._gpu_checkbox.blockSignals(False)
+
+    def _training_samples_path(self) -> Path:
+        return Path("data/training/training_samples.jsonl")
+
+    def _on_reset_dataset_clicked(self) -> None:
+        target_text = self._dataset_path_edit.text().strip()
+        if not target_text:
+            QMessageBox.warning(self, "Reset Dataset", "Please specify the dataset directory first.")
+            return
+
+        target_path = Path(target_text).expanduser().resolve()
+        samples_path = self._training_samples_path()
+
+        message = (
+            "This will permanently delete all captured screenshots under:\n"
+            f"{target_path}\n\n"
+            "and clear the training_samples.jsonl log.\n\n"
+            "Are you sure you want to continue?"
+        )
+        confirm = QMessageBox.question(
+            self,
+            "Reset Dataset",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        errors: List[str] = []
+
+        if target_path.exists():
+            try:
+                shutil.rmtree(target_path)
+            except OSError as exc:
+                errors.append(f"Failed to remove dataset directory: {exc}")
+
+        if samples_path.exists():
+            try:
+                samples_path.unlink()
+            except OSError as exc:
+                errors.append(f"Failed to remove {samples_path}: {exc}")
+
+        try:
+            target_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            errors.append(f"Unable to recreate dataset directory: {exc}")
+
+        if errors:
+            QMessageBox.critical(
+                self,
+                "Reset Dataset",
+                "\n".join(errors),
+            )
+            return
+
+        self._sample_logger = TrainingSampleLogger(samples_path)
+        self._last_screenshot_path = None
+        self._status_label.setText("Dataset cleared. Ready to capture new screenshots.")
+        self._training_status_label.setText("Training idle.")
+
+    def _on_start_training_clicked(self) -> None:
+        if self._training_process and self._training_process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.information(self, "Training", "Training is already running.")
+            return
+
+        samples_path = self._training_samples_path()
+        if not samples_path.exists() or samples_path.stat().st_size == 0:
+            QMessageBox.warning(
+                self,
+                "Training",
+                "No training samples found. Capture gameplay actions so that training_samples.jsonl is populated.",
+            )
+            return
+
+        script_path = Path("training/train_policy.py")
+        if not script_path.exists():
+            QMessageBox.critical(
+                self,
+                "Training",
+                f"Training script not found at {script_path}.",
+            )
+            return
+
+        output_dir = Path("models/policy")
+        device_arg = "cuda" if self._use_gpu else "cpu"
+        args = [
+            str(script_path),
+            "--samples",
+            str(samples_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            device_arg,
+        ]
+
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        process.readyReadStandardOutput.connect(self._on_training_output_ready)
+        process.finished.connect(self._on_training_finished)
+        process.start(sys.executable, args)
+
+        if not process.waitForStarted(5000):
+            QMessageBox.critical(
+                self,
+                "Training",
+                "Failed to start training process.",
+            )
+            process.deleteLater()
+            return
+
+        self._training_process = process
+        self._training_status_label.setText("Training started…")
+        self._update_training_controls()
+
+    def _on_stop_training_clicked(self) -> None:
+        if not self._training_process or self._training_process.state() == QProcess.ProcessState.NotRunning:
+            QMessageBox.information(self, "Training", "No training process is running.")
+            return
+        self._training_status_label.setText("Stopping training…")
+        self._training_process.terminate()
+
+    def _on_gpu_checkbox_changed(self, checked: bool) -> None:
+        self._use_gpu = bool(checked)
+        if self._use_gpu and not self._gpu_supported:
+            QMessageBox.information(
+                self,
+                "GPU Forcing",
+                "PyTorch did not detect a CUDA GPU. We'll attempt to use GPU anyway; if it fails the app will fall back to CPU.",
+            )
+        self._ocr_reader = None
+        if self._last_screenshot_bytes:
+            self._update_state_board_values(self._last_screenshot_bytes)
+        self._refresh_gpu_support()
+
+    def _on_training_output_ready(self) -> None:
+        if not self._training_process:
+            return
+        text = bytes(self._training_process.readAllStandardOutput()).decode(errors="ignore")
+        if not text:
+            return
+        last_line = text.strip().splitlines()[-1]
+        self._training_status_label.setText(f"Training: {last_line}")
+
+    def _on_training_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        if exit_status == QProcess.ExitStatus.NormalExit:
+            if exit_code == 0:
+                self._training_status_label.setText("Training completed successfully.")
+            else:
+                self._training_status_label.setText(
+                    f"Training finished with exit code {exit_code} (status {exit_status.name})."
+                )
+        else:
+            self._training_status_label.setText(
+                f"Training failed with exit code {exit_code} (status {exit_status.name})."
+            )
+        if self._training_process:
+            self._training_process.deleteLater()
+        self._training_process = None
+        self._update_training_controls()
+
+    def _update_training_controls(self) -> None:
+        process = getattr(self, "_training_process", None)
+        running = process is not None and process.state() != QProcess.ProcessState.NotRunning
+        self._start_training_button.setEnabled(not running)
+        self._stop_training_button.setEnabled(running)
 
     def _scenario_suffix(self) -> str:
         if self._current_scenario and self._next_scenario:
@@ -690,6 +1020,7 @@ class TrainTab(QWidget):
         self._status_label.setText(
             f"Tap sent to ({x}, {y}) on {self._current_device_label}. Capture more or enable live mode."
         )
+        self._log_training_sample(ActionRecord(type="tap", position=(x, y)))
 
     def _on_preview_dragged(self, x1: int, y1: int, x2: int, y2: int) -> None:
         if not self._current_serial:
@@ -726,6 +1057,14 @@ class TrainTab(QWidget):
         self._awaiting_swipe = False
         self._status_label.setText(
             f"Swipe sent from ({x1}, {y1}) to ({x2}, {y2}) on {self._current_device_label}."
+        )
+        self._log_training_sample(
+            ActionRecord(
+                type="swipe",
+                start=(x1, y1),
+                end=(x2, y2),
+                duration_ms=duration_ms,
+            )
         )
 
     def _map_preview_point(self, x: int, y: int) -> Optional[tuple[int, int, int, int]]:
@@ -964,7 +1303,24 @@ class TrainTab(QWidget):
             return self._ocr_reader
 
         try:
-            self._ocr_reader = easyocr.Reader(["en"], gpu=False)
+            try:
+                self._ocr_reader = easyocr.Reader(["en"], gpu=self._use_gpu)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("EasyOCR GPU init failed (gpu=%s): %s", self._use_gpu, exc)
+                if self._use_gpu:
+                    QMessageBox.warning(
+                        self,
+                        "EasyOCR",
+                        "Failed to initialize EasyOCR with GPU. Falling back to CPU.",
+                    )
+                    self._use_gpu = False
+                    self._gpu_checkbox.blockSignals(True)
+                    self._gpu_checkbox.setChecked(False)
+                    self._gpu_checkbox.blockSignals(False)
+                    self._ocr_reader = easyocr.Reader(["en"], gpu=False)
+                    self._refresh_gpu_support()
+                else:
+                    return None
             return self._ocr_reader
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to initialize EasyOCR Reader: {}", exc)
