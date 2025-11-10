@@ -1510,6 +1510,24 @@ class TrainTab(QWidget):
                 best_name = name
         return best_name
 
+    def _format_ratio_token(self, token: str) -> str:
+        normalized = token.strip()
+        if normalized.startswith("(") and normalized.endswith(")"):
+            normalized = normalized[1:-1]
+        numerator, denominator = normalized.split("/", 1)
+        numerator = numerator.strip()
+        denominator = denominator.strip()
+        try:
+            num_val = float(numerator.replace(",", ""))
+            den_val = float(denominator.replace(",", ""))
+            if abs(den_val) > 1e-9:
+                return f"{num_val / den_val:.4f}"
+        except ValueError:
+            pass
+        num_text = self._format_integer_string(numerator)
+        den_text = self._format_integer_string(denominator)
+        return f"{num_text}/{den_text}"
+
     def _refresh_preview_display(self) -> None:
         if not self._last_raw_pixmap:
             return
@@ -2302,31 +2320,28 @@ class TrainTab(QWidget):
         if not format_hint:
             return filtered if len(filtered) == 1 else [" ".join(filtered)]
 
-        merged = "".join(filtered).replace(" ", "")
+        combined = "".join(filtered)
+        tokens = combined.split()
+        if not tokens:
+            tokens = [combined.replace(" ", "")]
+
+        fmt_lower = format_hint.lower()
+        if fmt_lower.startswith("(") and fmt_lower.endswith(")"):
+            ratio_matches = re.findall(r"\(\s*([0-9.,]+/[0-9.,]+)\s*\)", combined)
+            if ratio_matches:
+                return [self._format_ratio_token(match) for match in ratio_matches]
+
+        merged = combined.replace(" ", "")
         if not merged:
             return []
 
-        fmt_lower = format_hint.lower()
         if fmt_lower in {"text", "string"}:
             return [" ".join(filtered)]
         if "/" in fmt_lower:
             ratio_source = merged.replace(" ", "")
             if ratio_source.count("/") == 1:
                 numerator, denominator = ratio_source.split("/")
-                try:
-                    num_val = float(numerator.replace(",", ""))
-                    den_val = float(denominator.replace(",", ""))
-                    if abs(den_val) > 1e-9:
-                        decimal = num_val / den_val
-                        return [f"{decimal:.4f}"]
-                except ValueError:
-                    pass
-                num_text = self._format_integer_string(numerator)
-                den_text = self._format_integer_string(denominator)
-                formatted = f"{num_text}/{den_text}"
-                if fmt_lower.startswith("(") and fmt_lower.endswith(")"):
-                    formatted = f"({formatted})"
-                return [formatted]
+                return [self._format_ratio_token(f"{numerator}/{denominator}")]
             return [ratio_source]
 
         if "%" in fmt_lower:
