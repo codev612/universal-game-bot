@@ -1,0 +1,6 @@
+{
+  "exact": 0.9,
+  "template": 0.8,
+  "multiscale": 0.85,
+  "orb": 0.8
+}

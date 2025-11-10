@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import io
 import re
+import json
 import shutil
 import sys
 from collections import defaultdict
@@ -10,8 +11,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import cv2
 from PyQt6.QtCore import QEvent, QObject, QProcess, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QMouseEvent, QPixmap
+from PyQt6.QtGui import QMouseEvent, QPixmap, QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -33,29 +35,47 @@ easyocr = None
 Image = ImageEnhance = ImageFilter = ImageOps = None
 torch = None
 
+DEFAULT_DETECTION_THRESHOLDS = {
+    "exact": 0.95,
+    "template": 0.88,
+    "multiscale": 0.85,
+    "orb": 0.80,
+}
+DEFAULT_COLOR_TOLERANCE = 35.0
+
+
 def _lazy_imports() -> None:
     global easyocr, Image, ImageEnhance, ImageFilter, ImageOps, torch
     if easyocr is None:
         try:
-            import easyocr  # type: ignore[import-not-found]
+            import easyocr as _easyocr  # type: ignore[import-not-found]
         except Exception as exc:  # noqa: BLE001
             easyocr = None  # type: ignore[assignment]
             logger.warning("EasyOCR not available: {}", exc)
+        else:
+            easyocr = _easyocr
     if Image is None:
         try:
-            from PIL import Image, ImageEnhance, ImageFilter, ImageOps  # type: ignore[import-not-found]
+            from PIL import Image as _Image, ImageEnhance as _ImageEnhance, ImageFilter as _ImageFilter, ImageOps as _ImageOps  # type: ignore[import-not-found]
         except Exception as exc:  # noqa: BLE001
             Image = None  # type: ignore[assignment]
             ImageEnhance = None  # type: ignore[assignment]
             ImageFilter = None  # type: ignore[assignment]
             ImageOps = None  # type: ignore[assignment]
             logger.warning("Pillow not available: {}", exc)
+        else:
+            Image = _Image
+            ImageEnhance = _ImageEnhance
+            ImageFilter = _ImageFilter
+            ImageOps = _ImageOps
     if torch is None:
         try:
-            import torch  # type: ignore[import-not-found]
+            import torch as _torch  # type: ignore[import-not-found]
         except Exception as exc:  # noqa: BLE001
             torch = None
             logger.warning("PyTorch not available: {}", exc)
+        else:
+            torch = _torch
 
 from core.device_manager import DeviceManager
 from core.layout_registry import LayoutRegistry
@@ -152,6 +172,28 @@ class TrainTab(QWidget):
         self._sample_logger = TrainingSampleLogger(Path("data/training/training_samples.jsonl"))
         self._last_screenshot_path: Optional[Path] = None
         self._training_process: Optional[QProcess] = None
+        self._snippet_matches: List[dict] = []
+        self._snippet_mask_cache: dict[str, Optional[np.ndarray]] = {}
+        (
+            self._detection_thresholds,
+            self._color_tolerance_default,
+        ) = self._load_detection_config()
+        try:
+            self._orb_detector = cv2.ORB_create()
+            self._bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ORB detector unavailable: {}", exc)
+            self._orb_detector = None
+            self._bf_matcher = None
+        cuda_mod = getattr(cv2, "cuda", None)
+        if cuda_mod is None:
+            self._cuda_available = False
+        else:
+            try:
+                self._cuda_available = cuda_mod.getCudaEnabledDeviceCount() > 0
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("CUDA detection failed: {}", exc)
+                self._cuda_available = False
 
         self._build_ui()
         self._wire_signals()
@@ -224,9 +266,12 @@ class TrainTab(QWidget):
         dataset_row.addWidget(browse_button)
 
         self._reset_dataset_button = QPushButton("Reset Dataset")
+        self._save_images_checkbox = QCheckBox("Save captured images to dataset")
+        self._save_images_checkbox.setChecked(True)
 
         dataset_layout.addLayout(dataset_row)
         dataset_layout.addWidget(self._reset_dataset_button)
+        dataset_layout.addWidget(self._save_images_checkbox)
 
         action_row = QHBoxLayout()
         self._capture_button = QPushButton("Capture Screenshot")
@@ -265,6 +310,17 @@ class TrainTab(QWidget):
         content_layout.addLayout(header_row)
         content_layout.addLayout(action_row)
         content_layout.addWidget(self._status_label)
+        self._detection_status_group = QGroupBox("Snippet Detection")
+        detection_layout = QVBoxLayout(self._detection_status_group)
+        self._detection_status_message = QLabel("No snippets processed yet.")
+        self._detection_status_message.setWordWrap(True)
+        detection_layout.addWidget(self._detection_status_message)
+        self._detection_results_widget = QWidget()
+        self._detection_results_layout = QVBoxLayout(self._detection_results_widget)
+        self._detection_results_layout.setContentsMargins(0, 0, 0, 0)
+        self._detection_results_layout.setSpacing(6)
+        detection_layout.addWidget(self._detection_results_widget)
+        self._detection_results_widget.hide()
 
         self._preview_group = QGroupBox("Last Capture Preview")
         preview_layout = QVBoxLayout(self._preview_group)
@@ -315,6 +371,20 @@ class TrainTab(QWidget):
             self._gpu_checkbox.setToolTip("CUDA GPU not detected in this environment.")
         training_layout.addWidget(self._gpu_checkbox)
 
+        detection_row = QHBoxLayout()
+        detection_row.addWidget(QLabel("Snippet detection:"))
+        self._detection_method_combo = QComboBox()
+        self._detection_method_combo.addItems(
+            [
+                "Template Matching",
+                "Multi-scale Template",
+                "ORB Features",
+                "All Methods (best)",
+            ]
+        )
+        detection_row.addWidget(self._detection_method_combo, stretch=1)
+        training_layout.addLayout(detection_row)
+
         training_row = QVBoxLayout()
         self._start_training_button = QPushButton("Start Training")
         self._stop_training_button = QPushButton("Stop Training")
@@ -334,8 +404,16 @@ class TrainTab(QWidget):
         note_label.setStyleSheet("color: #666666; font-size: 11px;")
         training_layout.addWidget(note_label)
 
+        left_column_widget = QWidget()
+        left_column_layout = QVBoxLayout(left_column_widget)
+        left_column_layout.setContentsMargins(0, 0, 0, 0)
+        left_column_layout.setSpacing(12)
+        left_column_layout.addWidget(self._ocr_results_group)
+        left_column_layout.addWidget(self._detection_status_group)
+        left_column_layout.addStretch(1)
+
         panels_row = QHBoxLayout()
-        panels_row.addWidget(self._ocr_results_group, stretch=1)
+        panels_row.addWidget(left_column_widget, stretch=1)
         panels_row.addWidget(self._preview_group, stretch=2)
         panels_row.addWidget(self._training_group, stretch=1)
         content_layout.addLayout(panels_row)
@@ -356,7 +434,6 @@ class TrainTab(QWidget):
         self._start_training_button.clicked.connect(self._on_start_training_clicked)
         self._stop_training_button.clicked.connect(self._on_stop_training_clicked)
         self._gpu_checkbox.toggled.connect(self._on_gpu_checkbox_changed)
-        self._reset_dataset_button.clicked.connect(self._on_reset_dataset_clicked)
         self._reset_dataset_button.clicked.connect(self._on_reset_dataset_clicked)
 
     def bind_signals(self) -> None:
@@ -448,29 +525,36 @@ class TrainTab(QWidget):
                 f"Live capture active for {self._current_game}{self._scenario_suffix()}…"
             )
 
-        dataset_dir = self._dataset_directory(create=True)
-        if dataset_dir is None:
-            return
-
         timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         game_name = self._current_game or "unknown_game"
-        game_dir = dataset_dir / game_name
-        game_dir.mkdir(parents=True, exist_ok=True)
-        target_dir = game_dir
-        scenario_dir = self._scenario_directory_name()
-        if scenario_dir:
-            target_dir = game_dir / scenario_dir
-            target_dir.mkdir(parents=True, exist_ok=True)
-        file_path = target_dir / f"{timestamp}{self._scenario_filename_suffix()}.png"
+        file_path: Optional[Path] = None
 
-        try:
-            file_path.write_bytes(data)
-        except OSError as exc:
-            logger.error("Failed to write screenshot {}: {}", file_path, exc)
-            QMessageBox.critical(self, "Capture Error", f"Failed to save screenshot:\n{exc}")
-            return
+        if self._save_images_checkbox.isChecked():
+            dataset_dir = self._dataset_directory(create=True)
+            if dataset_dir is None:
+                return
+            game_dir = dataset_dir / game_name
+            game_dir.mkdir(parents=True, exist_ok=True)
+            target_dir = game_dir
+            scenario_dir = self._scenario_directory_name()
+            if scenario_dir:
+                target_dir = game_dir / scenario_dir
+                target_dir.mkdir(parents=True, exist_ok=True)
+            file_path = target_dir / f"{timestamp}{self._scenario_filename_suffix()}.png"
 
-        self._last_screenshot_path = file_path
+        if file_path is not None:
+            try:
+                file_path.write_bytes(data)
+            except OSError as exc:
+                logger.error("Failed to write screenshot {}: {}", file_path, exc)
+                QMessageBox.critical(self, "Capture Error", f"Failed to save screenshot:\n{exc}")
+                return
+            self._last_screenshot_path = file_path
+            status_message = f"Screenshot saved to {file_path}"
+        else:
+            self._last_screenshot_path = None
+            status_message = "Screenshot captured (not saved to disk)."
+
         self._last_screenshot_bytes = bytes(data)
         pixmap = QPixmap()
         if pixmap.loadFromData(data, "PNG"):
@@ -481,11 +565,185 @@ class TrainTab(QWidget):
             self._last_raw_pixmap = None
             self._last_scaled_size = None
 
-        self._status_label.setText(f"Screenshot saved to {file_path}")
+        snippet_summary = self._detect_snippets_in_screenshot(data)
+        status_output = status_message
+        if snippet_summary:
+            status_output = f"{status_output} | {snippet_summary}"
+
+        self._refresh_preview_display()
+        self._status_label.setText(status_output)
         self._click_position_label.setText("Click on the preview to send a tap. Coordinates will appear here.")
-        logger.info("Training screenshot saved to {}", file_path)
+        if file_path is not None:
+            logger.info("Training screenshot saved to {}", file_path)
+        else:
+            logger.info("Training screenshot captured without saving to disk.")
         self._update_state_board_values(data)
-        self._log_idle_sample()
+        self._detect_snippets_in_screenshot(data)
+        if file_path is not None:
+            self._log_idle_sample()
+
+    def _detect_snippets_in_screenshot(self, png_bytes: bytes) -> str:
+        self._snippet_matches = []
+        if not self._current_game:
+            return ""
+
+        metadata_path = self._snippet_metadata_path()
+        if metadata_path is None or not metadata_path.exists():
+            return ""
+
+        try:
+            entries = self._load_snippet_entries(metadata_path)
+        except OSError as exc:
+            logger.warning("Failed to read snippet metadata: {}", exc)
+            return ""
+        if not entries:
+            return ""
+
+        np_bytes = np.frombuffer(png_bytes, np.uint8)
+        screenshot_color = cv2.imdecode(np_bytes, cv2.IMREAD_COLOR)
+        if screenshot_color is None:
+            return ""
+        screenshot_gray = cv2.cvtColor(screenshot_color, cv2.COLOR_BGR2GRAY)
+        img_height, img_width = screenshot_gray.shape[:2]
+
+        summary_parts: List[str] = []
+        detection_outcomes: Dict[str, bool] = {}
+        detection_scores: Dict[str, float] = {}
+        selected_method = (
+            self._detection_method_combo.currentText()
+            if hasattr(self, "_detection_method_combo")
+            else "Template Matching"
+        )
+
+        for entry in entries:
+            snippet_path = entry.get("file")
+            if not snippet_path:
+                continue
+            snippet_raw = cv2.imread(snippet_path, cv2.IMREAD_UNCHANGED)
+            if snippet_raw is None:
+                continue
+            snippet_alpha: Optional[np.ndarray] = None
+            if snippet_raw.ndim == 3:
+                if snippet_raw.shape[2] == 4:
+                    snippet_alpha = snippet_raw[:, :, 3]
+                    snippet_img = cv2.cvtColor(snippet_raw, cv2.COLOR_BGRA2BGR)
+                else:
+                    snippet_img = snippet_raw
+            else:
+                snippet_img = cv2.cvtColor(snippet_raw, cv2.COLOR_GRAY2BGR)
+            snippet_gray = cv2.cvtColor(snippet_img, cv2.COLOR_BGR2GRAY)
+            sh, sw = snippet_gray.shape[:2]
+            search = entry.get("search") or {}
+            mode = (search.get("mode") or "global").lower()
+            region = search.get("region") or {}
+            target_color = self._parse_hex_color(search.get("color"))
+            use_mask = bool(search.get("use_mask"))
+            thresholds = self._thresholds_for_entry(search)
+            color_tolerance = self._color_tolerance_for_entry(search)
+            mask = None
+            if use_mask:
+                if snippet_alpha is not None and cv2.countNonZero(snippet_alpha) > 0:
+                    mask = snippet_alpha
+                else:
+                    mask = self._get_snippet_mask(snippet_path, snippet_img)
+                    if mask is None:
+                        logger.debug("Mask generation failed for snippet {}; falling back to no mask.", snippet_path)
+                        use_mask = False
+
+            fallback_rect: Optional[Tuple[int, int, int, int]] = None
+            if mode == "exact":
+                rect = entry.get("rect") or {}
+                x1 = int(rect.get("x", 0))
+                y1 = int(rect.get("y", 0))
+                w = int(rect.get("width", sw))
+                h = int(rect.get("height", sh))
+                x2 = x1 + w
+                y2 = y1 + h
+                fallback_rect = (x1, y1, w, h)
+            elif mode == "custom":
+                x1 = int(region.get("x1", 0))
+                y1 = int(region.get("y1", 0))
+                x2 = int(region.get("x2", img_width))
+                y2 = int(region.get("y2", img_height))
+            else:  # global
+                x1, y1, x2, y2 = 0, 0, img_width, img_height
+
+            x1 = max(0, min(img_width, x1))
+            y1 = max(0, min(img_height, y1))
+            x2 = max(x1 + 1, min(img_width, x2))
+            y2 = max(y1 + 1, min(img_height, y2))
+
+            roi_gray = screenshot_gray[y1:y2, x1:x2]
+            roi_color = screenshot_color[y1:y2, x1:x2]
+            skip_detection = roi_gray.shape[0] < sh or roi_gray.shape[1] < sw
+
+            match_info: Optional[dict] = None
+            chosen_method: Optional[str] = None
+            if not skip_detection:
+                match_info, chosen_method = self._run_detection_methods(
+                    selected_method,
+                    mode,
+                    roi_gray,
+                    snippet_gray,
+                    x1,
+                    y1,
+                    thresholds,
+                    mask,
+                    roi_color,
+                    snippet_img,
+                )
+
+            debug_name = entry.get("export_name") or entry.get("name") or "snippet"
+            chosen_method = match_info.get("method") if match_info else None
+            if match_info and target_color is not None:
+                accepted = self._matches_target_color(
+                    screenshot_color,
+                    match_info,
+                    target_color,
+                    color_tolerance,
+                )
+            else:
+                accepted = bool(match_info)
+            try:
+                self._save_debug_snippet_crop(
+                    match_info,
+                    accepted,
+                    screenshot_color,
+                    mask,
+                    debug_name,
+                    fallback_rect,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to save debug snippet crop: {}", exc)
+
+            if match_info and accepted:
+                match_info["name"] = debug_name
+                match_info["method"] = chosen_method or (
+                self._detection_method_combo.currentText()
+                if hasattr(self, "_detection_method_combo")
+                else None
+            )
+                self._snippet_matches.append(match_info)
+                label = match_info["name"]
+                if match_info.get("method"):
+                    label = f"{label} [{match_info['method']}]"
+                summary_parts.append(f"{label} ({match_info['score']:.2f})")
+                detection_outcomes[debug_name] = True
+                detection_scores[debug_name] = float(match_info.get("score", 0.0))
+            else:
+                detection_outcomes[debug_name] = False
+                if match_info:
+                    detection_scores[debug_name] = float(match_info.get("score", 0.0))
+
+        self._update_detection_results(detection_outcomes, detection_scores)
+
+        if summary_parts:
+            return "Snippets detected."
+
+        if detection_outcomes:
+            any_hits = any(detection_outcomes.values())
+            return "Snippets detected." if any_hits else "Snippets detected: none matched."
+        return ""
 
     def _on_error(self, message: str) -> None:
         if self._pending_capture:
@@ -519,6 +777,362 @@ class TrainTab(QWidget):
                 QMessageBox.critical(self, "Dataset Path", f"Unable to create dataset directory:\n{exc}")
                 return None
         return path
+
+    def _get_snippet_mask(
+        self,
+        snippet_path: str,
+        snippet_color: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        key = str(snippet_path)
+        if key in self._snippet_mask_cache:
+            return self._snippet_mask_cache[key]
+        mask = self._generate_snippet_mask(snippet_color)
+        self._snippet_mask_cache[key] = mask
+        return mask
+
+    @staticmethod
+    def _generate_snippet_mask(snippet_color: np.ndarray) -> Optional[np.ndarray]:
+        try:
+            gray = cv2.cvtColor(snippet_color, cv2.COLOR_BGR2GRAY)
+        except cv2.error:
+            return None
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        diff = cv2.absdiff(gray, blurred)
+        _, mask = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if mask is None:
+            return None
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        if cv2.countNonZero(mask) < 25:
+            edges = cv2.Canny(gray, 50, 150)
+            if edges is None:
+                return None
+            mask = cv2.dilate(edges, kernel, iterations=1)
+        if cv2.countNonZero(mask) < 25:
+            return None
+        return mask
+
+    def _load_detection_config(self) -> tuple[dict[str, float], float]:
+        config_path = Path("config/snippet_detection.json")
+        if not config_path.exists():
+            try:
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                with config_path.open("w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            **DEFAULT_DETECTION_THRESHOLDS,
+                            "color_tolerance": DEFAULT_COLOR_TOLERANCE,
+                        },
+                        handle,
+                        indent=2,
+                    )
+            except OSError as exc:
+                logger.warning("Failed to create snippet detection config: {}", exc)
+            return dict(DEFAULT_DETECTION_THRESHOLDS), DEFAULT_COLOR_TOLERANCE
+        try:
+            with config_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read snippet detection config: {}", exc)
+            return dict(DEFAULT_DETECTION_THRESHOLDS), DEFAULT_COLOR_TOLERANCE
+
+        thresholds: dict[str, float] = dict(DEFAULT_DETECTION_THRESHOLDS)
+        for key in ("exact", "template", "multiscale", "orb"):
+            value = data.get(key)
+            if value is None:
+                continue
+            try:
+                thresholds[key] = float(value)
+            except (TypeError, ValueError):
+                logger.warning("Invalid threshold {}={} in config; using default.", key, value)
+        color_tol = DEFAULT_COLOR_TOLERANCE
+        if "color_tolerance" in data:
+            try:
+                color_tol = float(data["color_tolerance"])
+            except (TypeError, ValueError):
+                logger.warning("Invalid color_tolerance={} in config; using default.", data["color_tolerance"])
+        return thresholds, color_tol
+
+    def _thresholds_for_entry(self, search: dict) -> dict[str, float]:
+        base = search.get("threshold")
+
+        def resolve(key: str, default_key: str) -> float:
+            if key in search:
+                try:
+                    return float(search[key])
+                except (TypeError, ValueError):
+                    logger.warning("Invalid threshold value for {}: {}", key, search[key])
+            if base is not None:
+                try:
+                    return float(base)
+                except (TypeError, ValueError):
+                    logger.warning("Invalid base threshold: {}", base)
+            return self._detection_thresholds.get(default_key, DEFAULT_DETECTION_THRESHOLDS[default_key])
+
+        return {
+            "exact": resolve("threshold_exact", "exact"),
+            "template": resolve("threshold_template", "template"),
+            "multiscale": resolve("threshold_multiscale", "multiscale"),
+            "orb": resolve("threshold_orb", "orb"),
+        }
+
+    def _color_tolerance_for_entry(self, search: dict) -> float:
+        value = search.get("color_tolerance")
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                logger.warning("Invalid color_tolerance override: {}", value)
+        return self._color_tolerance_default
+
+    def _run_detection_methods(
+        self,
+        selected_method: str,
+        mode: str,
+        roi_gray: np.ndarray,
+        snippet_gray: np.ndarray,
+        origin_x: int,
+        origin_y: int,
+        thresholds: dict[str, float],
+        mask: Optional[np.ndarray],
+        roi_color: Optional[np.ndarray],
+        snippet_color: Optional[np.ndarray],
+    ) -> tuple[Optional[dict], Optional[str]]:
+        candidates: list[dict] = []
+
+        def consider(label: str, result: Optional[dict]) -> None:
+            if result and isinstance(result, dict):
+                entry = dict(result)
+                entry["method"] = label
+                candidates.append(entry)
+
+        method_map = {
+            "Template Matching": {"template"},
+            "Multi-scale Template": {"multiscale"},
+            "ORB Features": {"orb"},
+            "All Methods (best)": {"template", "multiscale", "orb"},
+        }
+        requested = method_map.get(selected_method, {"template"})
+
+        if mode == "exact":
+            result = self._match_exact_snippet(
+                roi_gray,
+                snippet_gray,
+                origin_x,
+                origin_y,
+                thresholds.get("exact", DEFAULT_DETECTION_THRESHOLDS["exact"]),
+                mask,
+                roi_color,
+                snippet_color,
+            )
+            consider("Exact Match", result)
+
+        template_result: Optional[dict] = None
+        if "template" in requested:
+            template_result = self._match_template(
+                roi_gray,
+                snippet_gray,
+                origin_x,
+                origin_y,
+                thresholds.get("template", DEFAULT_DETECTION_THRESHOLDS["template"]),
+                mask,
+            )
+            consider("Template Matching", template_result)
+
+        if "multiscale" in requested:
+            result = self._match_multiscale_template(
+                roi_gray,
+                snippet_gray,
+                origin_x,
+                origin_y,
+                thresholds.get("multiscale", DEFAULT_DETECTION_THRESHOLDS["multiscale"]),
+                mask,
+            )
+            consider("Multi-scale Template", result)
+
+        if "orb" in requested:
+            result = self._match_orb_snippet(
+                roi_gray,
+                snippet_gray,
+                origin_x,
+                origin_y,
+                thresholds.get("orb", DEFAULT_DETECTION_THRESHOLDS["orb"]),
+            )
+            consider("ORB Features", result)
+            if (
+                result is None
+                and template_result is None
+                and "template" not in requested
+            ):
+                template_result = self._match_template(
+                    roi_gray,
+                    snippet_gray,
+                    origin_x,
+                    origin_y,
+                    thresholds.get("template", DEFAULT_DETECTION_THRESHOLDS["template"]),
+                    mask,
+                )
+                consider("Template Matching", template_result)
+
+        if not candidates:
+            return None, None
+        best = max(candidates, key=lambda item: item.get("score", float("-inf")))
+        return best, best.get("method")
+
+    def _save_debug_snippet_crop(
+        self,
+        match_info: Optional[dict],
+        accepted: bool,
+        screenshot_color: np.ndarray,
+        mask: Optional[np.ndarray],
+        snippet_name: str,
+        fallback_rect: Optional[Tuple[int, int, int, int]] = None,
+    ) -> None:
+        if match_info:
+            x = int(match_info.get("x", 0))
+            y = int(match_info.get("y", 0))
+            w = int(match_info.get("w", 0))
+            h = int(match_info.get("h", 0))
+        elif fallback_rect:
+            x, y, w, h = fallback_rect
+        else:
+            return
+
+        if w <= 0 or h <= 0:
+            return
+
+        img_h, img_w = screenshot_color.shape[:2]
+        x1 = max(0, min(img_w, x))
+        y1 = max(0, min(img_h, y))
+        x2 = max(x1 + 1, min(img_w, x + w))
+        y2 = max(y1 + 1, min(img_h, y + h))
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        crop = screenshot_color[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+
+        alpha_channel: Optional[np.ndarray] = None
+        if mask is not None:
+            resized_mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            alpha_channel = resized_mask
+
+        if alpha_channel is None:
+            alpha_channel = np.full((h, w), 255, dtype=np.uint8)
+
+        rgba = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
+        rgba[:, :, 3] = alpha_channel
+
+        debug_dir = Path("data/debug_snippets")
+        if self._current_game:
+            debug_dir = debug_dir / self._slugify(self._current_game)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        status = "hit" if accepted else "miss"
+        filename = f"{timestamp}_{status}_{self._slugify(snippet_name)}.png"
+        cv2.imwrite(str((debug_dir / filename).resolve()), rgba)
+
+    @staticmethod
+    def _slugify(value: str) -> str:
+        text = value.strip().lower()
+        text = re.sub(r"[^\w.-]+", "-", text)
+        return text or "snippet"
+
+    @staticmethod
+    def _parse_hex_color(value: Optional[str]) -> Optional[Tuple[int, int, int]]:
+        if not value:
+            return None
+        text = value.strip().lower()
+        if not text:
+            return None
+        if text.startswith("#"):
+            text = text[1:]
+        if len(text) == 3:
+            try:
+                text = "".join(ch * 2 for ch in text)
+            except TypeError:
+                return None
+        if len(text) != 6:
+            return None
+        try:
+            r = int(text[0:2], 16)
+            g = int(text[2:4], 16)
+            b = int(text[4:6], 16)
+        except ValueError:
+            return None
+        return (b, g, r)
+
+    def _matches_target_color(
+        self,
+        screenshot_color: np.ndarray,
+        match_info: dict,
+        target_bgr: Tuple[int, int, int],
+        tolerance: float = DEFAULT_COLOR_TOLERANCE,
+    ) -> bool:
+        x = int(match_info.get("x", 0))
+        y = int(match_info.get("y", 0))
+        w = int(match_info.get("w", 0))
+        h = int(match_info.get("h", 0))
+        if w <= 0 or h <= 0:
+            return False
+        img_h, img_w = screenshot_color.shape[:2]
+        x1 = max(0, min(img_w, x))
+        y1 = max(0, min(img_h, y))
+        x2 = max(x1 + 1, min(img_w, x + w))
+        y2 = max(y1 + 1, min(img_h, y + h))
+        roi = screenshot_color[y1:y2, x1:x2]
+        if roi.size == 0:
+            return False
+        mean_bgr = roi.reshape(-1, 3).mean(axis=0)
+        diff = float(np.linalg.norm(mean_bgr - np.array(target_bgr, dtype=np.float32)))
+        return diff <= tolerance
+
+    def _update_detection_results(
+        self,
+        outcomes: Dict[str, bool],
+        scores: Dict[str, float],
+    ) -> None:
+        # Clear previous results
+        while self._detection_results_layout.count():
+            item = self._detection_results_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        if not outcomes:
+            self._detection_status_message.setText("No snippets processed yet.")
+            self._detection_results_widget.hide()
+            return
+
+        self._detection_status_message.setText("Latest snippet detection results:")
+        for name, outcome in outcomes.items():
+            row = QWidget()
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(12)
+            name_label = QLabel(name)
+            name_label.setMinimumWidth(140)
+            name_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            result_label = QLabel("Yes" if outcome else "No")
+            result_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            result_label.setStyleSheet(
+                "color: #2e7d32;" if outcome else "color: #c62828;"
+            )
+            score = scores.get(name)
+            if score is not None:
+                score_label = QLabel(f"Score: {score:.2f}")
+                score_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            else:
+                score_label = QLabel("")
+            layout.addWidget(name_label, stretch=1)
+            layout.addWidget(result_label)
+            layout.addWidget(score_label)
+            self._detection_results_layout.addWidget(row)
+
+        self._detection_results_layout.addStretch(1)
+        self._detection_results_widget.show()
 
     def _update_capture_state(self) -> None:
         has_device = self._current_serial is not None
@@ -680,7 +1294,34 @@ class TrainTab(QWidget):
             Qt.TransformationMode.SmoothTransformation,
         )
         self._last_scaled_size = (scaled.width(), scaled.height())
-        self._preview_label.setPixmap(scaled)
+        if self._snippet_matches:
+            draw_pixmap = QPixmap(scaled)
+            painter = QPainter(draw_pixmap)
+            pen = QPen(QColor(255, 0, 0))
+            pen.setWidth(3)
+            painter.setPen(pen)
+            font = painter.font()
+            font.setPointSize(max(8, font.pointSize()))
+            painter.setFont(font)
+            orig_w = self._last_raw_pixmap.width()
+            orig_h = self._last_raw_pixmap.height()
+            scale_x = scaled.width() / orig_w if orig_w else 1.0
+            scale_y = scaled.height() / orig_h if orig_h else 1.0
+            for match in self._snippet_matches:
+                rx = int(match["x"] * scale_x)
+                ry = int(match["y"] * scale_y)
+                rw = int(match["w"] * scale_x)
+                rh = int(match["h"] * scale_y)
+                painter.drawRect(rx, ry, rw, rh)
+                label = match.get("name") or "snippet"
+                method_label = match.get("method")
+                if method_label:
+                    label = f"{label} [{method_label}]"
+                painter.drawText(rx + 4, ry + 16, f"{label}")
+            painter.end()
+            self._preview_label.setPixmap(draw_pixmap)
+        else:
+            self._preview_label.setPixmap(scaled)
         self._preview_label.resize(scaled.size())
 
     def _refresh_gpu_support(self) -> None:
@@ -779,6 +1420,7 @@ class TrainTab(QWidget):
         self._last_screenshot_path = None
         self._status_label.setText("Dataset cleared. Ready to capture new screenshots.")
         self._training_status_label.setText("Training idle.")
+        self._snippet_mask_cache.clear()
 
     def _on_start_training_clicked(self) -> None:
         if self._training_process and self._training_process.state() != QProcess.ProcessState.NotRunning:
@@ -917,6 +1559,217 @@ class TrainTab(QWidget):
     def _store_scenario_history(self) -> None:
         key = self._current_game or self._GLOBAL_SCENARIO_KEY
         self._scenario_history[key] = (self._current_scenario, self._next_scenario)
+
+    def _snippet_metadata_path(self) -> Optional[Path]:
+        if not self._current_game:
+            return None
+        slug = self._sanitize_game_slug(self._current_game)
+        return Path("data") / "layout_snippets" / slug / "metadata.jsonl"
+
+    @staticmethod
+    def _sanitize_game_slug(name: str) -> str:
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "_", name.strip())
+        slug = slug.strip("_")
+        return slug or "unspecified"
+
+    @staticmethod
+    def _load_snippet_entries(path: Path) -> List[dict]:
+        entries: List[dict] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "search" not in entry:
+                    entry["search"] = {"mode": "global"}
+                entries.append(entry)
+        return entries
+
+    def _match_exact_snippet(
+        self,
+        roi_gray: np.ndarray,
+        snippet_gray: np.ndarray,
+        origin_x: int,
+        origin_y: int,
+        threshold: float,
+        mask: Optional[np.ndarray] = None,
+        roi_color: Optional[np.ndarray] = None,
+        snippet_color: Optional[np.ndarray] = None,
+    ) -> Optional[dict]:
+        sh, sw = snippet_gray.shape[:2]
+        roi_section = roi_gray[:sh, :sw]
+        if roi_section.shape[0] != sh or roi_section.shape[1] != sw:
+            return None
+        effective_mask: Optional[np.ndarray] = None
+        if mask is not None and mask.size:
+            if mask.shape[:2] != (sh, sw):
+                effective_mask = cv2.resize(mask, (sw, sh), interpolation=cv2.INTER_NEAREST)
+            else:
+                effective_mask = mask
+        if (
+            effective_mask is not None
+            and roi_color is not None
+            and roi_color.shape[0] >= sh
+            and roi_color.shape[1] >= sw
+            and snippet_color is not None
+            and snippet_color.shape[0] >= sh
+            and snippet_color.shape[1] >= sw
+        ):
+            mask_indices = effective_mask[:sh, :sw] > 0
+            if not np.any(mask_indices):
+                return None
+            roi_color_section = roi_color[:sh, :sw]
+            snippet_color_section = snippet_color[:sh, :sw]
+            diff_color = cv2.absdiff(roi_color_section, snippet_color_section)
+            diff_gray = cv2.cvtColor(diff_color, cv2.COLOR_BGR2GRAY)
+            score = 1.0 - float(diff_gray[mask_indices].mean()) / 255.0
+        else:
+            diff = cv2.absdiff(roi_section, snippet_gray)
+            score = 1.0 - float(diff.mean()) / 255.0
+        if score >= threshold:
+            return {"x": origin_x, "y": origin_y, "w": sw, "h": sh, "score": score}
+        return None
+
+    def _match_template(
+        self,
+        roi_gray: np.ndarray,
+        snippet_gray: np.ndarray,
+        origin_x: int,
+        origin_y: int,
+        threshold: float,
+        mask: Optional[np.ndarray] = None,
+    ) -> Optional[dict]:
+        sh, sw = snippet_gray.shape[:2]
+        if roi_gray.shape[0] < sh or roi_gray.shape[1] < sw:
+            return None
+        method = cv2.TM_CCORR_NORMED if mask is not None else cv2.TM_CCOEFF_NORMED
+        try:
+            if mask is None and self._use_gpu and self._cuda_available:
+                roi_gpu = cv2.cuda_GpuMat()
+                tmpl_gpu = cv2.cuda_GpuMat()
+                roi_gpu.upload(roi_gray)
+                tmpl_gpu.upload(snippet_gray)
+                res_gpu = cv2.cuda.matchTemplate(roi_gpu, tmpl_gpu, method)
+                result = res_gpu.download()
+            else:
+                raise AttributeError
+        except Exception:
+            if mask is not None:
+                result = cv2.matchTemplate(roi_gray, snippet_gray, method, mask=mask)
+            else:
+                result = cv2.matchTemplate(roi_gray, snippet_gray, method)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if max_val >= threshold:
+            x = origin_x + max_loc[0]
+            y = origin_y + max_loc[1]
+            return {"x": x, "y": y, "w": sw, "h": sh, "score": float(max_val)}
+        return None
+
+    def _match_multiscale_template(
+        self,
+        roi_gray: np.ndarray,
+        snippet_gray: np.ndarray,
+        origin_x: int,
+        origin_y: int,
+        threshold: float,
+        mask: Optional[np.ndarray] = None,
+    ) -> Optional[dict]:
+        sh, sw = snippet_gray.shape[:2]
+        best = None
+        best_val = -1.0
+        method = cv2.TM_CCORR_NORMED if mask is not None else cv2.TM_CCOEFF_NORMED
+        for scale in [0.8, 0.9, 1.0, 1.1, 1.2]:
+            scaled_w = max(1, int(sw * scale))
+            scaled_h = max(1, int(sh * scale))
+            if roi_gray.shape[0] < scaled_h or roi_gray.shape[1] < scaled_w:
+                continue
+            scaled_template = cv2.resize(snippet_gray, (scaled_w, scaled_h))
+            scaled_mask = None
+            if mask is not None:
+                scaled_mask = cv2.resize(mask, (scaled_w, scaled_h), interpolation=cv2.INTER_NEAREST)
+                if cv2.countNonZero(scaled_mask) == 0:
+                    scaled_mask = None
+            try:
+                if mask is None and self._use_gpu and self._cuda_available:
+                    roi_gpu = cv2.cuda_GpuMat()
+                    tmpl_gpu = cv2.cuda_GpuMat()
+                    roi_gpu.upload(roi_gray)
+                    tmpl_gpu.upload(scaled_template)
+                    res_gpu = cv2.cuda.matchTemplate(roi_gpu, tmpl_gpu, method)
+                    result = res_gpu.download()
+                else:
+                    raise AttributeError
+            except Exception:
+                if scaled_mask is not None:
+                    result = cv2.matchTemplate(roi_gray, scaled_template, method, mask=scaled_mask)
+                else:
+                    result = cv2.matchTemplate(roi_gray, scaled_template, method)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            if max_val > best_val:
+                best_val = float(max_val)
+                best = (max_loc, scaled_w, scaled_h)
+        if best is None or best_val < threshold:
+            return None
+        max_loc, scaled_w, scaled_h = best
+        x = origin_x + max_loc[0]
+        y = origin_y + max_loc[1]
+        return {"x": x, "y": y, "w": scaled_w, "h": scaled_h, "score": best_val}
+
+    def _match_orb_snippet(
+        self,
+        roi_gray: np.ndarray,
+        snippet_gray: np.ndarray,
+        origin_x: int,
+        origin_y: int,
+        threshold: float,
+    ) -> Optional[dict]:
+        if self._orb_detector is None or self._bf_matcher is None:
+            return None
+        kp1, des1 = self._orb_detector.detectAndCompute(snippet_gray, None)
+        if des1 is None or len(kp1) < 4:
+            return None
+        kp2, des2 = self._orb_detector.detectAndCompute(roi_gray, None)
+        if des2 is None or len(kp2) < 4:
+            return None
+
+        try:
+            matches = self._bf_matcher.match(des1, des2)
+        except cv2.error:
+            return None
+        matches = sorted(matches, key=lambda m: m.distance)
+        good_matches = matches[:40]
+        if len(good_matches) < 8:
+            return None
+
+        pts1 = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        pts2 = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+        H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, 5.0)
+        if H is None or mask is None:
+            return None
+        inliers = int(mask.sum())
+        if inliers < 6:
+            return None
+
+        sh, sw = snippet_gray.shape[:2]
+        corners = np.float32([[0, 0], [sw, 0], [sw, sh], [0, sh]]).reshape(-1, 1, 2)
+        projected = cv2.perspectiveTransform(corners, H)
+        xs = projected[:, 0, 0]
+        ys = projected[:, 0, 1]
+        x_min = max(0, min(xs)) + origin_x
+        y_min = max(0, min(ys)) + origin_y
+        x_max = max(xs) + origin_x
+        y_max = max(ys) + origin_y
+        w = max(1, int(x_max - x_min))
+        h = max(1, int(y_max - y_min))
+        score = inliers / max(len(good_matches), 1)
+        if score < threshold:
+            return None
+        return {"x": int(x_min), "y": int(y_min), "w": w, "h": h, "score": float(score)}
 
     def _on_live_toggled(self, checked: bool) -> None:
         if checked:
@@ -1178,6 +2031,8 @@ class TrainTab(QWidget):
             return []
 
         fmt_lower = format_hint.lower()
+        if fmt_lower in {"text", "string"}:
+            return [" ".join(filtered)]
         if "/" in fmt_lower:
             ratio_source = merged.replace(" ", "")
             if ratio_source.count("/") == 1:
