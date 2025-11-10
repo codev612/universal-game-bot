@@ -6,7 +6,8 @@
       "x": 1530,
       "y": 522,
       "width": 62,
-      "height": 58
+      "height": 58,
+      "value_format": null
     },
     {
       "name": "scan",
@@ -14,7 +15,8 @@
       "x": 1398,
       "y": 520,
       "width": 57,
-      "height": 62
+      "height": 62,
+      "value_format": null
     },
     {
       "name": "hand",
@@ -22,7 +24,8 @@
       "x": 1659,
       "y": 517,
       "width": 69,
-      "height": 69
+      "height": 69,
+      "value_format": null
     },
     {
       "name": "horse",
@@ -30,7 +33,8 @@
       "x": 1797,
       "y": 520,
       "width": 62,
-      "height": 66
+      "height": 66,
+      "value_format": null
     },
     {
       "name": "fight",
@@ -38,7 +42,8 @@
       "x": 1502,
       "y": 653,
       "width": 124,
-      "height": 117
+      "height": 117,
+      "value_format": null
     },
     {
       "name": "menu",
@@ -46,7 +51,8 @@
       "x": 1797,
       "y": 23,
       "width": 64,
-      "height": 52
+      "height": 52,
+      "value_format": null
     },
     {
       "name": "mail",
@@ -54,7 +60,8 @@
       "x": 1707,
       "y": 22,
       "width": 51,
-      "height": 54
+      "height": 54,
+      "value_format": null
     },
     {
       "name": "bag",
@@ -62,7 +69,8 @@
       "x": 1515,
       "y": 21,
       "width": 58,
-      "height": 48
+      "height": 48,
+      "value_format": null
     },
     {
       "name": "shortcut",
@@ -70,7 +78,8 @@
       "x": 365,
       "y": 125,
       "width": 34,
-      "height": 43
+      "height": 43,
+      "value_format": null
     },
     {
       "name": "merchant",
@@ -78,7 +87,8 @@
       "x": 359,
       "y": 232,
       "width": 43,
-      "height": 45
+      "height": 45,
+      "value_format": null
     },
     {
       "name": "map",
@@ -86,7 +96,17 @@
       "x": 52,
       "y": 119,
       "width": 288,
-      "height": 184
+      "height": 184,
+      "value_format": null
+    },
+    {
+      "name": "movement",
+      "category": "Controls",
+      "x": 200,
+      "y": 699,
+      "width": 200,
+      "height": 203,
+      "value_format": null
     },
     {
       "name": "mp board",
@@ -94,7 +114,8 @@
       "x": 48,
       "y": 18,
       "width": 280,
-      "height": 31
+      "height": 31,
+      "value_format": "xxxx/yyyy"
     },
     {
       "name": "red bottle",
@@ -102,7 +123,8 @@
       "x": 604,
       "y": 930,
       "width": 69,
-      "height": 69
+      "height": 69,
+      "value_format": null
     },
     {
       "name": "bag weight",
@@ -110,15 +132,44 @@
       "x": 1514,
       "y": 72,
       "width": 58,
-      "height": 32
+      "height": 32,
+      "value_format": "xx%"
     },
     {
-      "name": "quests",
+      "name": "first quest",
       "category": "State Boards",
-      "x": 1319,
-      "y": 112,
-      "width": 463,
-      "height": 363
+      "x": 1682,
+      "y": 154,
+      "width": 93,
+      "height": 72,
+      "value_format": "(xxx/yyy)"
+    },
+    {
+      "name": "second quest",
+      "category": "State Boards",
+      "x": 1668,
+      "y": 216,
+      "width": 119,
+      "height": 77,
+      "value_format": "(xxx/yyy)"
+    },
+    {
+      "name": "coins",
+      "category": "State Boards",
+      "x": 1048,
+      "y": 25,
+      "width": 178,
+      "height": 39,
+      "value_format": "currency(x,yyy,zzz)"
+    },
+    {
+      "name": "level",
+      "category": "State Boards",
+      "x": 7,
+      "y": 978,
+      "width": 119,
+      "height": 63,
+      "value_format": null
     }
   ]
 }

@@ -38,12 +38,22 @@ class Category:
     ALL = [CONTROLS, STATE_BOARDS, DIALOGUES]
 
 
+STATE_BOARD_VALUE_FORMATS = [
+    "(xxx/yyy)",
+    "xxxx/yyyy",
+    "xx%",
+    "xxxx",
+    "currency(x,yyy,zzz)",
+]
+
+
 @dataclass(slots=True)
 class ControlMapping:
     name: str
     rect: Tuple[int, int, int, int]  # x, y, width, height
     category: str = Category.CONTROLS
     notes: str = ""
+    value_format: str = ""
 
 
 class _NameInputDialog(QDialog):
@@ -126,6 +136,7 @@ class LayoutDesignerTab(QWidget):
         self._current_game: Optional[str] = None
         self._controls_per_category: Dict[str, List[ControlMapping]] = {cat: [] for cat in Category.ALL}
         self._pixmap: Optional[QPixmap] = None
+        self._updating_value_format = False
 
         self._build_ui()
         self._wire_signals()
@@ -180,6 +191,19 @@ class LayoutDesignerTab(QWidget):
 
         control_layout.addLayout(button_row)
 
+        format_row = QHBoxLayout()
+        self._value_format_label = QLabel("Value Format:")
+        self._value_format_combo = QComboBox()
+        self._value_format_combo.addItem("Automatic (no format)", "")
+        for option in STATE_BOARD_VALUE_FORMATS:
+            self._value_format_combo.addItem(option, option)
+        self._value_format_combo.setEnabled(False)
+        format_row.addWidget(self._value_format_label)
+        format_row.addWidget(self._value_format_combo, stretch=1)
+        control_layout.addLayout(format_row)
+        self._value_format_label.setVisible(False)
+        self._value_format_combo.setVisible(False)
+
         splitter.addWidget(canvas_scroll)
         splitter.addWidget(control_box)
         splitter.setStretchFactor(0, 3)
@@ -200,8 +224,9 @@ class LayoutDesignerTab(QWidget):
         self._rename_button.clicked.connect(self._on_rename_clicked)
         self._delete_button.clicked.connect(self._on_delete_clicked)
         self._control_list.itemDoubleClicked.connect(self._on_rename_item)
-        self._control_list.currentItemChanged.connect(lambda *_: self._update_buttons())
+        self._control_list.currentItemChanged.connect(self._on_control_selection_changed)
         self._canvas.region_drawn.connect(self._on_region_drawn)
+        self._value_format_combo.currentIndexChanged.connect(self._on_value_format_changed)
 
     def bind_signals(self) -> None:
         self._device_manager.error_occurred.connect(self._on_error)
@@ -326,12 +351,78 @@ class LayoutDesignerTab(QWidget):
         for controls in self._controls_per_category.values():
             for control in controls:
                 rect = QRect(control.rect[0], control.rect[1], control.rect[2], control.rect[3])
-                regions.append(Region(name=f"[{control.category}] {control.name}", rect=rect))
+                label = f"[{control.category}] {control.name}"
+                if control.category == Category.STATE_BOARDS and control.value_format:
+                    label = f"{label} [{control.value_format}]"
+                regions.append(Region(name=label, rect=rect))
         self._canvas.set_regions(regions)
 
     def _format_control_text(self, control: ControlMapping) -> str:
         x, y, w, h = control.rect
-        return f"{control.name} — ({x}, {y}, {w}, {h})"
+        base = f"{control.name} — ({x}, {y}, {w}, {h})"
+        if control.category == Category.STATE_BOARDS and control.value_format:
+            return f"{base} [{control.value_format}]"
+        return base
+
+    def _on_control_selection_changed(
+        self,
+        current: Optional[QListWidgetItem],
+        previous: Optional[QListWidgetItem],
+    ) -> None:
+        self._update_buttons()
+        self._update_value_format_ui()
+
+    def _select_value_format(self, value: str) -> None:
+        self._updating_value_format = True
+        try:
+            target_value = value or ""
+            index = self._value_format_combo.findData(target_value)
+            if index == -1 and target_value:
+                self._value_format_combo.addItem(target_value, target_value)
+                index = self._value_format_combo.findData(target_value)
+            self._value_format_combo.setCurrentIndex(index if index != -1 else 0)
+        finally:
+            self._updating_value_format = False
+
+    def _update_value_format_ui(self) -> None:
+        is_state_board = self.current_category == Category.STATE_BOARDS
+        self._value_format_label.setVisible(is_state_board)
+        self._value_format_combo.setVisible(is_state_board)
+
+        if not is_state_board:
+            self._value_format_combo.setEnabled(False)
+            self._select_value_format("")
+            return
+
+        current_row = self._control_list.currentRow()
+        controls = self._controls_per_category[self.current_category]
+        if current_row < 0 or current_row >= len(controls):
+            self._value_format_combo.setEnabled(False)
+            self._select_value_format("")
+            return
+
+        control = controls[current_row]
+        self._value_format_combo.setEnabled(True)
+        self._select_value_format(control.value_format)
+
+    def _on_value_format_changed(self, index: int) -> None:
+        if self._updating_value_format:
+            return
+        if self.current_category != Category.STATE_BOARDS:
+            return
+
+        current_row = self._control_list.currentRow()
+        controls = self._controls_per_category[self.current_category]
+        if current_row < 0 or current_row >= len(controls):
+            return
+
+        control = controls[current_row]
+        selected_value = self._value_format_combo.currentData()
+        control.value_format = str(selected_value) if selected_value else ""
+        item = self._control_list.item(current_row)
+        if item:
+            item.setText(self._format_control_text(control))
+        self._persist_current_regions()
 
     def _update_buttons(self) -> None:
         has_device = self._current_serial is not None
@@ -346,6 +437,7 @@ class LayoutDesignerTab(QWidget):
         self._delete_button.setEnabled(
             has_game and bool(controls) and self._control_list.currentItem() is not None
         )
+        self._update_value_format_ui()
 
     @property
     def current_category(self) -> str:
@@ -370,6 +462,7 @@ class LayoutDesignerTab(QWidget):
         for control in self._controls_per_category[category]:
             self._control_list.addItem(self._format_control_text(control))
         self._update_canvas_regions()
+        self._update_value_format_ui()
 
     def _update_status_for_context(self) -> None:
         if self._current_game and self._current_serial:
@@ -401,6 +494,7 @@ class LayoutDesignerTab(QWidget):
                 name=region.name,
                 rect=(region.x, region.y, region.width, region.height),
                 category=category,
+                value_format=region.value_format or "",
             )
             self._controls_per_category.setdefault(category, []).append(control)
 
@@ -433,6 +527,7 @@ class LayoutDesignerTab(QWidget):
                         y=control.rect[1],
                         width=control.rect[2],
                         height=control.rect[3],
+                        value_format=control.value_format or None,
                     )
                 )
 

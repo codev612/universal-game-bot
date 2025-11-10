@@ -16,12 +16,13 @@ class RegionConfig:
     y: int
     width: int
     height: int
+    value_format: Optional[str] = None
 
-    def to_dict(self) -> Dict[str, int | str]:
+    def to_dict(self) -> Dict[str, object]:
         return asdict(self)
 
     @staticmethod
-    def from_dict(data: Dict[str, int | str]) -> RegionConfig:
+    def from_dict(data: Dict[str, object]) -> RegionConfig:
         return RegionConfig(
             name=str(data["name"]),
             category=str(data["category"]),
@@ -29,6 +30,7 @@ class RegionConfig:
             y=int(data["y"]),
             width=int(data["width"]),
             height=int(data["height"]),
+            value_format=str(data["value_format"]) if data.get("value_format") not in {None, ""} else None,
         )
 
 

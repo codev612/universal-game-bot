@@ -116,6 +116,8 @@ class TrainTab(QWidget):
         self._awaiting_swipe: bool = False
         self._ocr_reader: Optional["easyocr.Reader"] = None
         self._ocr_enabled: bool = True
+        self._state_board_inputs: Dict[str, QLineEdit] = {}
+        self._state_board_captured: Dict[str, List[str]] = {}
 
         self._build_ui()
         self._wire_signals()
@@ -197,11 +199,18 @@ class TrainTab(QWidget):
 
         self._ocr_results_group = QGroupBox("State Board Values")
         ocr_layout = QVBoxLayout(self._ocr_results_group)
-        self._ocr_results_label = QLabel(
+        self._state_board_message = QLabel(
             "Configure State Boards in the Layout Designer to see OCR results here."
         )
-        self._ocr_results_label.setWordWrap(True)
-        ocr_layout.addWidget(self._ocr_results_label)
+        self._state_board_message.setWordWrap(True)
+        ocr_layout.addWidget(self._state_board_message)
+
+        self._state_board_results_widget = QWidget()
+        self._state_board_results_layout = QVBoxLayout(self._state_board_results_widget)
+        self._state_board_results_layout.setContentsMargins(0, 0, 0, 0)
+        self._state_board_results_layout.setSpacing(8)
+        ocr_layout.addWidget(self._state_board_results_widget)
+        self._state_board_results_widget.hide()
         layout.addWidget(self._ocr_results_group)
 
     def _wire_signals(self) -> None:
@@ -234,9 +243,7 @@ class TrainTab(QWidget):
         if self._last_screenshot_bytes:
             self._update_state_board_values(self._last_screenshot_bytes)
         else:
-            self._ocr_results_label.setText(
-                "Capture a screenshot to populate State Board values."
-            )
+            self._set_state_board_message("Capture a screenshot to populate State Board values.")
 
     def shutdown(self) -> None:
         """Stop timers and pending operations before application exit."""
@@ -554,13 +561,13 @@ class TrainTab(QWidget):
             return
 
         if easyocr is None or Image is None:
-            self._ocr_results_label.setText(
+            self._set_state_board_message(
                 "OCR dependencies not available. Install easyocr and Pillow to enable this feature."
             )
             return
 
         if not self._current_game:
-            self._ocr_results_label.setText("Select a game to associate OCR regions.")
+            self._set_state_board_message("Select a game to associate OCR regions.")
             return
 
         regions = [
@@ -570,7 +577,7 @@ class TrainTab(QWidget):
         ]
 
         if not regions:
-            self._ocr_results_label.setText(
+            self._set_state_board_message(
                 "No State Boards configured for this game. Create them in the Layout Designer."
             )
             return
@@ -583,7 +590,7 @@ class TrainTab(QWidget):
             image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to load screenshot for OCR: {}", exc)
-            self._ocr_results_label.setText("Unable to load screenshot for OCR processing.")
+            self._set_state_board_message("Unable to load screenshot for OCR processing.")
             return
 
         width, height = image.size
@@ -601,24 +608,142 @@ class TrainTab(QWidget):
                 texts = reader.readtext(
                     np_region,
                     detail=0,
-                    allowlist="0123456789.,",
+                    allowlist="0123456789.,/()%+-",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("OCR failed for region {}: {}", region.name, exc)
                 continue
 
             cleaned = [text.strip() for text in texts if text and text.strip()]
+            cleaned = self._apply_state_board_format(region, cleaned)
             if cleaned:
                 results[region.name].extend(cleaned)
 
         if not results:
-            self._ocr_results_label.setText("No numeric values detected in State Boards.")
+            self._set_state_board_message("No numeric values detected in State Boards.")
             return
 
-        lines = []
+        self._populate_state_board_results(results)
+
+    def _apply_state_board_format(self, region, texts: List[str]) -> List[str]:
+        filtered = [text for text in texts if text]
+        if not filtered:
+            return []
+
+        format_hint = (getattr(region, "value_format", None) or "").strip()
+        if not format_hint:
+            return filtered if len(filtered) == 1 else [" ".join(filtered)]
+
+        merged = "".join(filtered).replace(" ", "")
+        if not merged:
+            return []
+
+        fmt_lower = format_hint.lower()
+        if "/" in fmt_lower:
+            ratio_source = merged.replace(" ", "")
+            if ratio_source.count("/") == 1:
+                numerator, denominator = ratio_source.split("/")
+                num_text = self._format_integer_string(numerator)
+                den_text = self._format_integer_string(denominator)
+                formatted = f"{num_text}/{den_text}"
+                if fmt_lower.startswith("(") and fmt_lower.endswith(")"):
+                    formatted = f"({formatted})"
+                return [formatted]
+            return [ratio_source]
+
+        if "%" in fmt_lower:
+            normalized = merged.rstrip("%")
+            number = self._coerce_number(normalized)
+            if number is not None:
+                return [f"{number:.2f}%"]
+            if normalized:
+                return [f"{normalized}%"]
+            return [merged]
+
+        if "currency" in fmt_lower or "," in merged:
+            digits_only = merged.replace(",", "")
+            formatted_currency = self._format_integer_string(digits_only)
+            return [formatted_currency]
+
+        return [merged]
+
+    @staticmethod
+    def _coerce_number(value: str) -> Optional[float]:
+        try:
+            cleaned = value.replace(",", "")
+            return float(cleaned)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_integer_string(value: str) -> str:
+        trimmed = value.strip()
+        sign = ""
+        if trimmed.startswith(("+", "-")):
+            sign = trimmed[0]
+            trimmed = trimmed[1:]
+        stripped = "".join(ch for ch in trimmed if ch.isdigit())
+        if not stripped:
+            return value
+        try:
+            as_int = int(stripped)
+            return f"{sign}{as_int:,}"
+        except ValueError:
+            return value
+
+    def _set_state_board_message(self, text: str) -> None:
+        self._state_board_message.setText(text)
+        self._state_board_message.show()
+        self._state_board_results_widget.hide()
+        self._state_board_inputs.clear()
+        self._state_board_captured.clear()
+        self._clear_state_board_results()
+
+    def _clear_state_board_results(self) -> None:
+        while self._state_board_results_layout.count():
+            item = self._state_board_results_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _populate_state_board_results(self, results: Dict[str, List[str]]) -> None:
+        previous_inputs = {name: edit.text() for name, edit in self._state_board_inputs.items()}
+        self._state_board_inputs.clear()
+        self._state_board_captured = {name: list(texts) for name, texts in results.items()}
+        self._clear_state_board_results()
+
+        self._state_board_message.hide()
+        self._state_board_results_widget.show()
+
         for name, texts in results.items():
-            lines.append(f"{name}: {', '.join(texts)}")
-        self._ocr_results_label.setText("\n".join(lines))
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(12)
+
+            name_label = QLabel(name)
+            name_label.setMinimumWidth(120)
+            name_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+            captured_label = QLabel(", ".join(texts))
+            captured_label.setWordWrap(True)
+            captured_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+            correct_prompt = QLabel("Correct:")
+            correct_prompt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            input_edit = QLineEdit(previous_inputs.get(name, ""))
+            input_edit.setPlaceholderText("Enter correct value")
+
+            row_layout.addWidget(name_label)
+            row_layout.addWidget(captured_label, stretch=1)
+            row_layout.addWidget(correct_prompt)
+            row_layout.addWidget(input_edit)
+
+            self._state_board_results_layout.addWidget(row_widget)
+            self._state_board_inputs[name] = input_edit
+
+        self._state_board_results_layout.addStretch(1)
 
     def _get_ocr_reader(self) -> Optional["easyocr.Reader"]:
         if easyocr is None:
@@ -632,7 +757,7 @@ class TrainTab(QWidget):
             return self._ocr_reader
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to initialize EasyOCR Reader: {}", exc)
-            self._ocr_results_label.setText(f"OCR initialization failed: {exc}")
+            self._set_state_board_message(f"OCR initialization failed: {exc}")
             self._ocr_enabled = False
             return None
 
