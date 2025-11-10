@@ -79,11 +79,12 @@ def evaluate(
                 states = states.to(device)
             scenarios_curr = batch["scenario_current"].to(device)
             scenarios_next = batch["scenario_next"].to(device)
+            player_state = batch["player_state"].to(device)
             action_type = batch["action_type"].to(device)
             coords = batch["coords"].to(device)
             mask = batch["coords_mask"].to(device)
 
-            logits, coords_pred = model(images, scenarios_curr, scenarios_next, states)
+            logits, coords_pred = model(images, scenarios_curr, scenarios_next, states, player_state)
             loss_type = criterion(logits, action_type)
             loss_coords = coord_loss(coords_pred, coords, mask)
 
@@ -110,7 +111,9 @@ def train(args: argparse.Namespace) -> None:
     model = PolicyModel(
         state_dim=len(dataset.state_keys),
         scenario_vocab_size=len(dataset.scenario_to_index),
+        player_state_vocab_size=len(dataset.player_state_to_index),
         scenario_embed_dim=args.scenario_embed_dim,
+        player_state_embed_dim=args.player_state_embed_dim,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -133,12 +136,13 @@ def train(args: argparse.Namespace) -> None:
                 states = states.to(device)
             scenarios_curr = batch["scenario_current"].to(device)
             scenarios_next = batch["scenario_next"].to(device)
+            player_state = batch["player_state"].to(device)
             action_type = batch["action_type"].to(device)
             coords = batch["coords"].to(device)
             mask = batch["coords_mask"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            logits, coords_pred = model(images, scenarios_curr, scenarios_next, states)
+            logits, coords_pred = model(images, scenarios_curr, scenarios_next, states, player_state)
 
             loss_type = type_criterion(logits, action_type)
             loss_coords = coord_loss(coords_pred, coords, mask)
@@ -184,6 +188,7 @@ def train(args: argparse.Namespace) -> None:
         json.dump(
             {
                 "scenario_to_index": dataset.scenario_to_index,
+                "player_state_to_index": dataset.player_state_to_index,
                 "state_keys": dataset.state_keys,
             },
             handle,
@@ -205,6 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", help="'cpu', 'cuda', or 'auto'")
     parser.add_argument("--scenario-embed-dim", type=int, default=32)
+    parser.add_argument("--player-state-embed-dim", type=int, default=16)
     parser.add_argument("--max-samples", type=int, default=None)
     return parser.parse_args()
 

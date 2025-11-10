@@ -26,6 +26,7 @@ class TrainingSample:
     game: Optional[str]
     scenario_current: Optional[str]
     scenario_next: Optional[str]
+    player_state: Optional[str]
     state_board_values: Dict[str, str]
     action: ActionRecord
     timestamp: str

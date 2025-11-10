@@ -13,7 +13,9 @@ class PolicyModel(nn.Module):
         self,
         state_dim: int,
         scenario_vocab_size: int,
+        player_state_vocab_size: int,
         scenario_embed_dim: int = 32,
+        player_state_embed_dim: int = 16,
     ) -> None:
         super().__init__()
 
@@ -31,6 +33,15 @@ class PolicyModel(nn.Module):
         self.scenario_embedding = nn.Embedding(scenario_vocab_size, scenario_embed_dim)
         scenario_feat_dim = scenario_embed_dim * 2
 
+        if player_state_vocab_size > 0:
+            self.player_state_embedding: Optional[nn.Embedding] = nn.Embedding(
+                player_state_vocab_size, player_state_embed_dim
+            )
+            player_state_feat_dim = player_state_embed_dim
+        else:
+            self.player_state_embedding = None
+            player_state_feat_dim = 0
+
         self.state_encoder: Optional[nn.Module]
         if state_dim > 0:
             self.state_encoder = nn.Sequential(
@@ -42,7 +53,7 @@ class PolicyModel(nn.Module):
             self.state_encoder = None
             state_feat_dim = 0
 
-        fused_dim = 256 + scenario_feat_dim + state_feat_dim
+        fused_dim = 256 + scenario_feat_dim + state_feat_dim + player_state_feat_dim
         self.fusion = nn.Sequential(
             nn.Linear(fused_dim, 256),
             nn.ReLU(inplace=True),
@@ -59,6 +70,7 @@ class PolicyModel(nn.Module):
         scenario_current: torch.Tensor,
         scenario_next: torch.Tensor,
         states: Optional[torch.Tensor] = None,
+        player_state: Optional[torch.Tensor] = None,
     ):
         visual_feat = self.backbone(images).flatten(1)
         visual_feat = self.visual_projection(visual_feat)
@@ -75,6 +87,8 @@ class PolicyModel(nn.Module):
 
         if self.state_encoder is not None and states is not None:
             features.append(self.state_encoder(states))
+        if self.player_state_embedding is not None and player_state is not None:
+            features.append(self.player_state_embedding(player_state))
 
         fused = torch.cat(features, dim=1)
         fused = self.fusion(fused)

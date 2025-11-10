@@ -42,6 +42,13 @@ DEFAULT_DETECTION_THRESHOLDS = {
     "orb": 0.80,
 }
 DEFAULT_COLOR_TOLERANCE = 35.0
+PLAYER_STATE_PRESETS = [
+    "Low blood",
+    "No moving",
+    "No progressing",
+    "Progressing",
+    "Heavy weight",
+]
 
 
 def _lazy_imports() -> None:
@@ -153,6 +160,10 @@ class TrainTab(QWidget):
         self._current_scenario: Optional[str] = None
         self._next_scenario: Optional[str] = None
         self._scenario_history: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        self._player_state_presets: List[str] = list(PLAYER_STATE_PRESETS)
+        self._player_state_history: Dict[str, Optional[str]] = {}
+        self._current_player_state: Optional[str] = None
+        self._updating_player_state = False
         self._available_scenarios: List[str] = []
         self._gpu_supported = bool(torch and torch.cuda.is_available())
         self._use_gpu = self._gpu_supported
@@ -198,6 +209,7 @@ class TrainTab(QWidget):
         self._build_ui()
         self._wire_signals()
         self._reload_scenarios()
+        self._restore_player_state()
         self._scenario_registry.scenarios_changed.connect(self._on_scenarios_changed)
         self._refresh_gpu_support()
         self._update_training_controls()
@@ -253,6 +265,13 @@ class TrainTab(QWidget):
         scenario_row_layout.addWidget(self._manage_scenarios_button)
 
         info_form.addRow("Scenario:", scenario_row_widget)
+
+        self._player_state_combo = QComboBox()
+        self._player_state_combo.setEditable(True)
+        self._player_state_combo.addItem("No player state")
+        for option in self._player_state_presets:
+            self._player_state_combo.addItem(option)
+        info_form.addRow("Player state:", self._player_state_combo)
 
         dataset_group = QGroupBox("Dataset")
         dataset_layout = QVBoxLayout(dataset_group)
@@ -435,6 +454,7 @@ class TrainTab(QWidget):
         self._stop_training_button.clicked.connect(self._on_stop_training_clicked)
         self._gpu_checkbox.toggled.connect(self._on_gpu_checkbox_changed)
         self._reset_dataset_button.clicked.connect(self._on_reset_dataset_clicked)
+        self._player_state_combo.currentTextChanged.connect(self._on_player_state_changed)
 
     def bind_signals(self) -> None:
         """
@@ -458,10 +478,12 @@ class TrainTab(QWidget):
         if previous_game != game_name:
             key = previous_game or self._GLOBAL_SCENARIO_KEY
             self._scenario_history[key] = (self._current_scenario, self._next_scenario)
+            self._player_state_history[key] = self._current_player_state
 
         self._current_game = game_name
         self._game_value.setText(game_name or "No game selected")
         self._reload_scenarios()
+        self._restore_player_state()
         self._update_capture_state()
         if self._last_screenshot_bytes:
             self._update_state_board_values(self._last_screenshot_bytes)
@@ -1251,6 +1273,20 @@ class TrainTab(QWidget):
     def _on_scenarios_changed(self, _: List[str]) -> None:
         self._reload_scenarios()
 
+    def _on_player_state_changed(self, text: str) -> None:
+        if self._updating_player_state:
+            return
+        value = text.strip()
+        if not value or value.lower() == "no player state":
+            self._current_player_state = None
+        else:
+            if value not in self._player_state_presets:
+                self._player_state_presets.append(value)
+            if self._player_state_combo.findText(value) == -1:
+                self._player_state_combo.addItem(value)
+            self._current_player_state = value
+        self._store_player_state_history()
+
     def _log_training_sample(self, action: ActionRecord) -> None:
         if not self._last_screenshot_path:
             logger.warning("Skipping training sample; no screenshot has been captured yet.")
@@ -1261,6 +1297,7 @@ class TrainTab(QWidget):
             game=self._current_game,
             scenario_current=self._current_scenario,
             scenario_next=self._next_scenario,
+            player_state=self._current_player_state,
             state_board_values=self.get_state_board_values(),
             action=action,
             timestamp=TrainingSample.timestamp_now(),
@@ -1559,6 +1596,29 @@ class TrainTab(QWidget):
     def _store_scenario_history(self) -> None:
         key = self._current_game or self._GLOBAL_SCENARIO_KEY
         self._scenario_history[key] = (self._current_scenario, self._next_scenario)
+
+    def _store_player_state_history(self) -> None:
+        key = self._current_game or self._GLOBAL_SCENARIO_KEY
+        self._player_state_history[key] = self._current_player_state
+
+    def _restore_player_state(self) -> None:
+        key = self._current_game or self._GLOBAL_SCENARIO_KEY
+        saved = self._player_state_history.get(key)
+        self._set_player_state(saved)
+
+    def _set_player_state(self, state: Optional[str]) -> None:
+        self._updating_player_state = True
+        try:
+            if state and self._player_state_combo.findText(state) == -1:
+                self._player_state_combo.addItem(state)
+            if state:
+                self._player_state_combo.setCurrentText(state)
+            else:
+                self._player_state_combo.setCurrentIndex(0)
+                self._player_state_combo.setCurrentText("No player state")
+            self._current_player_state = state
+        finally:
+            self._updating_player_state = False
 
     def _snippet_metadata_path(self) -> Optional[Path]:
         if not self._current_game:
@@ -2037,6 +2097,14 @@ class TrainTab(QWidget):
             ratio_source = merged.replace(" ", "")
             if ratio_source.count("/") == 1:
                 numerator, denominator = ratio_source.split("/")
+                try:
+                    num_val = float(numerator.replace(",", ""))
+                    den_val = float(denominator.replace(",", ""))
+                    if abs(den_val) > 1e-9:
+                        decimal = num_val / den_val
+                        return [f"{decimal:.4f}"]
+                except ValueError:
+                    pass
                 num_text = self._format_integer_string(numerator)
                 den_text = self._format_integer_string(denominator)
                 formatted = f"{num_text}/{den_text}"

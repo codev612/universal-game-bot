@@ -19,6 +19,7 @@ class SampleEntry:
     game: Optional[str]
     scenario_current: Optional[str]
     scenario_next: Optional[str]
+    player_state: Optional[str]
     state_board_values: Dict[str, str]
     action_type: ActionType
     action_payload: Dict[str, Optional[Tuple[int, int]]]
@@ -76,6 +77,7 @@ class PolicyDataset(Dataset):
         self.entries: List[SampleEntry] = []
         scenario_names: Dict[str, None] = {}
         state_keys: Dict[str, None] = {}
+        player_state_names: Dict[str, None] = {}
 
         with self._jsonl_path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -101,6 +103,7 @@ class PolicyDataset(Dataset):
                     game=payload.get("game"),
                     scenario_current=payload.get("scenario_current"),
                     scenario_next=payload.get("scenario_next"),
+                    player_state=payload.get("player_state"),
                     state_board_values=payload.get("state_board_values") or {},
                     action_type=action_type,  # type: ignore[assignment]
                     action_payload=action,
@@ -111,6 +114,8 @@ class PolicyDataset(Dataset):
                     scenario_names.setdefault(entry.scenario_current, None)
                 if entry.scenario_next:
                     scenario_names.setdefault(entry.scenario_next, None)
+                if entry.player_state:
+                    player_state_names.setdefault(entry.player_state, None)
                 for key in entry.state_board_values:
                     state_keys.setdefault(key, None)
 
@@ -125,6 +130,9 @@ class PolicyDataset(Dataset):
             self.scenario_to_index[name] = len(self.scenario_to_index)
 
         self.state_keys: List[str] = sorted(state_keys.keys())
+        self.player_state_to_index = {"<none>": 0}
+        for name in sorted(player_state_names.keys()):
+            self.player_state_to_index[name] = len(self.player_state_to_index)
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -142,6 +150,7 @@ class PolicyDataset(Dataset):
 
         current_idx = self.scenario_to_index.get(entry.scenario_current, 0)
         next_idx = self.scenario_to_index.get(entry.scenario_next, 0)
+        player_state_idx = self.player_state_to_index.get(entry.player_state or "<none>", 0)
 
         action_type_idx = {"tap": 0, "swipe": 1, "idle": 2}.get(entry.action_type, 2)
         coords = torch.zeros(5, dtype=torch.float32)
@@ -172,6 +181,7 @@ class PolicyDataset(Dataset):
             "path": str(entry.screenshot_path),
             "image_size": (height, width),
             "game": entry.game,
+            "player_state": entry.player_state,
         }
 
         return {
@@ -179,6 +189,7 @@ class PolicyDataset(Dataset):
             "state": state_vector,
             "scenario_current": torch.tensor(current_idx, dtype=torch.long),
             "scenario_next": torch.tensor(next_idx, dtype=torch.long),
+            "player_state": torch.tensor(player_state_idx, dtype=torch.long),
             "action_type": torch.tensor(action_type_idx, dtype=torch.long),
             "coords": coords,
             "coords_mask": mask,
@@ -191,6 +202,7 @@ class PolicyDataset(Dataset):
         states = torch.stack([item["state"] for item in batch], dim=0) if batch[0]["state"].numel() else None
         scenario_current = torch.stack([item["scenario_current"] for item in batch], dim=0)
         scenario_next = torch.stack([item["scenario_next"] for item in batch], dim=0)
+        player_state = torch.stack([item["player_state"] for item in batch], dim=0)
         action_type = torch.stack([item["action_type"] for item in batch], dim=0)
         coords = torch.stack([item["coords"] for item in batch], dim=0)
         mask = torch.stack([item["coords_mask"] for item in batch], dim=0)
@@ -201,6 +213,7 @@ class PolicyDataset(Dataset):
             "states": states,
             "scenario_current": scenario_current,
             "scenario_next": scenario_next,
+            "player_state": player_state,
             "action_type": action_type,
             "coords": coords,
             "coords_mask": mask,
