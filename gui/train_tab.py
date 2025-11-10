@@ -1619,6 +1619,7 @@ class TrainTab(QWidget):
             self._current_player_state = state
         finally:
             self._updating_player_state = False
+        self._store_player_state_history()
 
     def _snippet_metadata_path(self) -> Optional[Path]:
         if not self._current_game:
