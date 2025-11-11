@@ -127,7 +127,7 @@
       "value_format": null
     },
     {
-      "name": "mp board",
+      "name": "mp_board",
       "category": "State Boards",
       "x": 48,
       "y": 18,
@@ -136,7 +136,7 @@
       "value_format": "xxxx/yyyy"
     },
     {
-      "name": "first quest",
+      "name": "first_quest",
       "category": "State Boards",
       "x": 1682,
       "y": 154,
@@ -145,7 +145,7 @@
       "value_format": "(xxx/yyy)"
     },
     {
-      "name": "second quest",
+      "name": "second_quest",
       "category": "State Boards",
       "x": 1668,
       "y": 216,

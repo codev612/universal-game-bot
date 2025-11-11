@@ -9,7 +9,7 @@ import shutil
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import cv2
@@ -18,6 +18,8 @@ from PyQt6.QtGui import QMouseEvent, QPixmap, QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -80,7 +82,10 @@ from core.device_manager import DeviceManager
 from core.layout_registry import LayoutRegistry
 from core.scenario_registry import ScenarioRegistry
 from core.player_state_registry import PlayerStateRegistry
+from core.policy_runner import PolicyRunner, PolicyActionPrediction
+from core.rule_engine import RuleEngine, RuleSnapshot, SnippetObservation
 from core.training_sample import ActionRecord, TrainingSample, TrainingSampleLogger
+from gui.rule_editor_dialog import RuleEditorDialog
 from gui.player_state_dialog import PlayerStateDialog
 
 
@@ -207,6 +212,15 @@ class TrainTab(QWidget):
                 logger.debug("CUDA detection failed: {}", exc)
                 self._cuda_available = False
 
+        self._policy_runner: Optional[PolicyRunner] = None
+        self._policy_enabled: bool = False
+        self._policy_model_path: Optional[Path] = None
+        self._policy_metadata_path: Optional[Path] = None
+        self._last_policy_prediction: Optional[PolicyActionPrediction] = None
+        self._rule_engine = RuleEngine(self._scenario_registry)
+        self._rule_snapshot_path = Path("rules") / "last_snapshot.json"
+        self._last_rule_snapshot: Optional[RuleSnapshot] = None
+
         self._build_ui()
         self._wire_signals()
         self._reload_scenarios()
@@ -216,6 +230,8 @@ class TrainTab(QWidget):
         self._on_player_states_changed(self._player_state_registry.player_states())
         self._refresh_gpu_support()
         self._update_training_controls()
+        self._update_policy_controls()
+        self._update_rule_preview()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -361,6 +377,36 @@ class TrainTab(QWidget):
         detection_layout.addLayout(target_row)
         self._update_target_snippet_combo([])
 
+        self._rule_group = QGroupBox("Rule Engine")
+        rule_layout = QVBoxLayout(self._rule_group)
+        rule_layout.setSpacing(6)
+        self._rule_summary_label = QLabel(
+            "Capture snippets or OCR values to preview matching rules."
+        )
+        self._rule_summary_label.setWordWrap(True)
+        self._rule_summary_label.setStyleSheet("color: #444444;")
+        rule_layout.addWidget(self._rule_summary_label)
+
+        self._rule_action_label = QLabel("")
+        self._rule_action_label.setWordWrap(True)
+        rule_layout.addWidget(self._rule_action_label)
+
+        rule_buttons = QHBoxLayout()
+        self._rule_reload_button = QPushButton("Reload")
+        self._rule_reload_button.clicked.connect(self._on_reload_rules_clicked)
+        self._rule_edit_button = QPushButton("Edit…")
+        self._rule_edit_button.clicked.connect(self._on_edit_rules_clicked)
+        self._rule_test_button = QPushButton("Test Now")
+        self._rule_test_button.clicked.connect(self._on_test_rules_clicked)
+        self._rule_run_button = QPushButton("Run Action")
+        self._rule_run_button.clicked.connect(self._on_run_rules_clicked)
+        rule_buttons.addWidget(self._rule_reload_button)
+        rule_buttons.addWidget(self._rule_edit_button)
+        rule_buttons.addWidget(self._rule_test_button)
+        rule_buttons.addWidget(self._rule_run_button)
+        rule_buttons.addStretch(1)
+        rule_layout.addLayout(rule_buttons)
+
         self._preview_group = QGroupBox("Last Capture Preview")
         preview_layout = QVBoxLayout(self._preview_group)
 
@@ -443,12 +489,57 @@ class TrainTab(QWidget):
         note_label.setStyleSheet("color: #666666; font-size: 11px;")
         training_layout.addWidget(note_label)
 
+        training_layout.addSpacing(8)
+
+        policy_header = QLabel("Policy model:")
+        policy_header.setStyleSheet("font-weight: bold;")
+        training_layout.addWidget(policy_header)
+
+        self._policy_model_label = QLabel("No checkpoint loaded.")
+        self._policy_model_label.setWordWrap(True)
+        self._policy_model_label.setStyleSheet("color: #555555;")
+        training_layout.addWidget(self._policy_model_label)
+
+        policy_buttons = QHBoxLayout()
+        self._policy_load_button = QPushButton("Load Checkpoint…")
+        self._policy_unload_button = QPushButton("Unload")
+        self._policy_unload_button.setEnabled(False)
+        policy_buttons.addWidget(self._policy_load_button)
+        policy_buttons.addWidget(self._policy_unload_button)
+        training_layout.addLayout(policy_buttons)
+
+        threshold_row = QHBoxLayout()
+        threshold_row.addWidget(QLabel("Min confidence:"))
+        self._policy_confidence_spin = QDoubleSpinBox()
+        self._policy_confidence_spin.setRange(0.0, 1.0)
+        self._policy_confidence_spin.setSingleStep(0.05)
+        self._policy_confidence_spin.setValue(0.6)
+        self._policy_confidence_spin.setDecimals(2)
+        threshold_row.addWidget(self._policy_confidence_spin, stretch=1)
+        training_layout.addLayout(threshold_row)
+
+        self._policy_toggle_button = QPushButton("Enable Policy Control")
+        self._policy_toggle_button.setCheckable(True)
+        self._policy_toggle_button.setEnabled(False)
+        training_layout.addWidget(self._policy_toggle_button)
+
+        self._policy_status_label = QLabel("Policy control idle.")
+        self._policy_status_label.setWordWrap(True)
+        training_layout.addWidget(self._policy_status_label)
+
+        if torch is None:
+            self._policy_load_button.setEnabled(False)
+            self._policy_toggle_button.setEnabled(False)
+            self._policy_confidence_spin.setEnabled(False)
+            self._policy_status_label.setText("PyTorch is required for policy inference.")
+
         left_column_widget = QWidget()
         left_column_layout = QVBoxLayout(left_column_widget)
         left_column_layout.setContentsMargins(0, 0, 0, 0)
         left_column_layout.setSpacing(12)
         left_column_layout.addWidget(self._ocr_results_group)
         left_column_layout.addWidget(self._detection_status_group)
+        left_column_layout.addWidget(self._rule_group)
         left_column_layout.addStretch(1)
 
         panels_row = QHBoxLayout()
@@ -476,6 +567,10 @@ class TrainTab(QWidget):
         self._reset_dataset_button.clicked.connect(self._on_reset_dataset_clicked)
         self._player_state_combo.currentTextChanged.connect(self._on_player_state_changed)
         self._target_snippet_combo.currentTextChanged.connect(self._on_target_snippet_changed)
+        if torch is not None:
+            self._policy_load_button.clicked.connect(self._on_load_policy_model_clicked)
+            self._policy_unload_button.clicked.connect(self._on_unload_policy_model_clicked)
+            self._policy_toggle_button.toggled.connect(self._on_policy_toggle_changed)
 
     def bind_signals(self) -> None:
         """
@@ -493,6 +588,7 @@ class TrainTab(QWidget):
         self._current_device_label = display_name or "No device selected"
         self._device_value.setText(self._current_device_label)
         self._update_capture_state()
+        self._update_policy_controls()
 
     def set_active_game(self, game_name: Optional[str]) -> None:
         previous_game = self._current_game
@@ -622,6 +718,7 @@ class TrainTab(QWidget):
             logger.info("Training screenshot captured without saving to disk.")
         self._update_state_board_values(data)
         self._detect_snippets_in_screenshot(data)
+        self._maybe_run_policy_control(data)
         if file_path is not None:
             self._log_idle_sample()
 
@@ -781,6 +878,7 @@ class TrainTab(QWidget):
         self._last_detection_outcomes = dict(detection_outcomes)
         self._last_detection_scores = dict(detection_scores)
         self._update_detection_results(detection_outcomes, detection_scores)
+        self._update_rule_preview()
 
         if summary_parts:
             return "Snippets detected."
@@ -1250,6 +1348,394 @@ class TrainTab(QWidget):
     def _snippet_name_detected(self, name: Optional[str]) -> bool:
         return bool(name and name in self._last_detection_outcomes)
 
+    def _known_snippet_names(self) -> List[str]:
+        names: set[str] = set()
+        path = self._snippet_metadata_path()
+        if path and path.exists():
+            try:
+                entries = self._load_snippet_entries(path)
+            except OSError:
+                entries = []
+            for entry in entries:
+                candidate = entry.get("export_name") or entry.get("name")
+                if candidate:
+                    names.add(str(candidate))
+        for detected_name in self._last_detection_outcomes.keys():
+            if detected_name:
+                names.add(detected_name)
+        return sorted(names, key=str.lower)
+
+    def _snippet_position_map(self) -> Dict[str, Tuple[int, int, int, int]]:
+        positions: Dict[str, Tuple[int, int, int, int]] = {}
+        path = self._snippet_metadata_path()
+        if not path or not path.exists():
+            return positions
+        try:
+            entries = self._load_snippet_entries(path)
+        except OSError:
+            entries = []
+        for entry in entries:
+            name = entry.get("export_name") or entry.get("name")
+            rect = entry.get("rect") or {}
+            x = rect.get("x")
+            y = rect.get("y")
+            width = rect.get("width")
+            height = rect.get("height")
+            if (
+                name
+                and isinstance(x, (int, float))
+                and isinstance(y, (int, float))
+                and isinstance(width, (int, float))
+                and isinstance(height, (int, float))
+            ):
+                positions[str(name)] = (int(x), int(y), int(width), int(height))
+        for match in self._snippet_matches:
+            name = match.get("name")
+            x = match.get("x")
+            y = match.get("y")
+            w = match.get("w")
+            h = match.get("h")
+            if (
+                name
+                and isinstance(x, (int, float))
+                and isinstance(y, (int, float))
+                and isinstance(w, (int, float))
+                and isinstance(h, (int, float))
+            ):
+                positions[str(name)] = (int(x), int(y), int(w), int(h))
+        return positions
+
+    def _snippet_swipe_templates(self) -> Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]:
+        cache = getattr(self, "_swipe_template_cache", None)
+        if cache is not None:
+            return dict(cache)
+
+        templates: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]] = {}
+        samples_path = Path("data") / "training" / "training_samples.jsonl"
+        if not samples_path.exists():
+            self._swipe_template_cache = templates
+            return templates
+
+        sums: Dict[str, Dict[str, float]] = {}
+        counts: Dict[str, int] = {}
+
+        try:
+            with samples_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    action = entry.get("action") or {}
+                    if action.get("type") != "swipe":
+                        continue
+                    target = action.get("target_snippet")
+                    start = action.get("start")
+                    end = action.get("end")
+                    if (
+                        not target
+                        or not isinstance(start, list)
+                        or not isinstance(end, list)
+                        or len(start) != 2
+                        or len(end) != 2
+                    ):
+                        continue
+                    sx, sy = start
+                    ex, ey = end
+                    if not all(isinstance(v, (int, float)) for v in (sx, sy, ex, ey)):
+                        continue
+                    bucket = sums.setdefault(
+                        target,
+                        {"sx": 0.0, "sy": 0.0, "ex": 0.0, "ey": 0.0},
+                    )
+                    bucket["sx"] += float(sx)
+                    bucket["sy"] += float(sy)
+                    bucket["ex"] += float(ex)
+                    bucket["ey"] += float(ey)
+                    counts[target] = counts.get(target, 0) + 1
+        except OSError:
+            self._swipe_template_cache = templates
+            return templates
+
+        for name, bucket in sums.items():
+            count = counts.get(name, 0)
+            if count <= 0:
+                continue
+            start = (int(round(bucket["sx"] / count)), int(round(bucket["sy"] / count)))
+            end = (int(round(bucket["ex"] / count)), int(round(bucket["ey"] / count)))
+            templates[name] = (start, end)
+
+        self._swipe_template_cache = dict(templates)
+        return dict(templates)
+
+    def _on_reload_rules_clicked(self) -> None:
+        try:
+            self._rule_engine.reload()
+            self._rule_summary_label.setText("Rules reloaded from disk.")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to reload rules: {}", exc)
+            QMessageBox.warning(self, "Rule Engine", f"Unable to reload rules:\n{exc}")
+        self._update_rule_preview()
+
+    def _on_edit_rules_clicked(self) -> None:
+        snippet_names = self._known_snippet_names()
+        snippet_map = self._snippet_position_map()
+        snippet_swipes = self._snippet_swipe_templates()
+        dialog = RuleEditorDialog(
+            self._scenario_registry,
+            snippet_names=snippet_names,
+            snippet_positions=snippet_map,
+            snippet_swipes=snippet_swipes,
+            snapshot_path=self._rule_snapshot_path,
+            parent=self,
+        )
+        result = dialog.exec()
+        if result == QDialog.DialogCode.Accepted:
+            self._rule_engine.reload()
+            self._update_rule_preview()
+
+    def _on_test_rules_clicked(self) -> None:
+        try:
+            snapshot = self._build_rule_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to build rule snapshot: {}", exc)
+            QMessageBox.warning(self, "Rule Test", f"Unable to build snapshot:\n{exc}")
+            return
+
+        has_data = (
+            snapshot.snippets
+            or snapshot.state_values
+            or snapshot.player_state
+            or snapshot.scenario_current
+            or snapshot.scenario_next
+        )
+        if not has_data:
+            QMessageBox.information(
+                self,
+                "Rule Test",
+                "Capture a screenshot or OCR values first, then try again.",
+            )
+            return
+
+        try:
+            match = self._rule_engine.evaluate(snapshot, respect_cooldowns=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Rule evaluation failed: {}", exc)
+            QMessageBox.warning(self, "Rule Test", f"Rule evaluation failed:\n{exc}")
+            return
+
+        if match is None:
+            QMessageBox.information(
+                self,
+                "Rule Test",
+                "No rule matched the latest snapshot.",
+            )
+            return
+
+        action_text = self._rule_engine.describe_action(match.action)
+        QMessageBox.information(
+            self,
+            "Rule Test",
+            f"Matched rule '{match.rule.name}'\nAction: {action_text}",
+        )
+
+    def _on_run_rules_clicked(self) -> None:
+        if not self._current_serial:
+            QMessageBox.information(
+                self,
+                "Rule Action",
+                "Connect a device before running actions.",
+            )
+            return
+        if not self._device_manager:
+            QMessageBox.warning(
+                self,
+                "Rule Action",
+                "Device manager unavailable.",
+            )
+            return
+
+        try:
+            snapshot = self._build_rule_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to build rule snapshot: {}", exc)
+            QMessageBox.warning(self, "Rule Action", f"Unable to build snapshot:\n{exc}")
+            return
+
+        has_data = (
+            snapshot.snippets
+            or snapshot.state_values
+            or snapshot.player_state
+            or snapshot.scenario_current
+            or snapshot.scenario_next
+        )
+        if not has_data:
+            QMessageBox.information(
+                self,
+                "Rule Action",
+                "Capture a screenshot or OCR values first, then try again.",
+            )
+            return
+
+        try:
+            match = self._rule_engine.evaluate(snapshot, respect_cooldowns=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Rule evaluation failed: {}", exc)
+            QMessageBox.warning(self, "Rule Action", f"Rule evaluation failed:\n{exc}")
+            return
+
+        if match is None:
+            QMessageBox.information(
+                self,
+                "Rule Action",
+                "No rule matched the latest snapshot.",
+            )
+            return
+
+        action = match.action
+        action_type = action.type
+        params = action.params
+        summary = self._rule_engine.describe_action(action)
+
+        try:
+            if action_type == "tap":
+                coords = params.get("coordinates")
+                if not coords:
+                    raise ValueError("Tap action missing coordinates")
+                x, y = coords
+                self._device_manager.send_tap(self._current_serial, int(x), int(y))
+            elif action_type == "swipe":
+                start = params.get("start") or params.get("coordinates")
+                end = params.get("end")
+                if not start or not end:
+                    raise ValueError("Swipe action missing start/end coordinates")
+                duration = int(params.get("duration_ms", 300))
+                self._device_manager.send_swipe(
+                    self._current_serial,
+                    int(start[0]),
+                    int(start[1]),
+                    int(end[0]),
+                    int(end[1]),
+                    duration,
+                )
+            elif action_type == "scenario":
+                scenario_name = params.get("name")
+                if not scenario_name:
+                    raise ValueError("Scenario action missing name")
+                QMessageBox.information(
+                    self,
+                    "Rule Action",
+                    f"Scenario '{scenario_name}' selected. Apply it manually if needed.",
+                )
+                return
+            else:
+                QMessageBox.information(
+                    self,
+                    "Rule Action",
+                    f"Action type '{action_type}' not supported for direct execution.",
+                )
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Rule action execution failed: {}", exc)
+            QMessageBox.warning(self, "Rule Action", f"Failed to execute action:\n{exc}")
+            return
+
+        QMessageBox.information(
+            self,
+            "Rule Action",
+            f"Executed: {summary}",
+        )
+
+    def _build_rule_snapshot(self) -> RuleSnapshot:
+        snippets: Dict[str, SnippetObservation] = {}
+        for name, detected in self._last_detection_outcomes.items():
+            score = self._last_detection_scores.get(name)
+            snippets[name] = SnippetObservation(detected=bool(detected), score=score)
+
+        try:
+            state_values = self.get_state_board_values() if self._state_board_captured else {}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Falling back to last captured state board snapshot: {}", exc)
+            state_values = self._state_board_snapshot()
+
+        metadata = {
+            "auto_target": self._auto_target_guess,
+            "manual_target": self._current_action_target,
+        }
+
+        return RuleSnapshot(
+            snippets=snippets,
+            state_values=state_values,
+            scenario_current=self._current_scenario,
+            scenario_next=self._next_scenario,
+            player_state=self._current_player_state,
+            metadata=metadata,
+        )
+
+    def _update_rule_preview(self) -> None:
+        snapshot = self._build_rule_snapshot()
+        self._last_rule_snapshot = snapshot
+        self._rule_action_label.setStyleSheet("")
+
+        has_snippets = bool(snapshot.snippets)
+        has_state = bool(snapshot.state_values)
+        if not (has_snippets or has_state or snapshot.player_state or snapshot.scenario_current or snapshot.scenario_next):
+            self._rule_summary_label.setText("Capture snippets or OCR values to preview matching rules.")
+            self._rule_action_label.clear()
+            self._persist_rule_snapshot(snapshot)
+            return
+
+        try:
+            match = self._rule_engine.evaluate(snapshot, respect_cooldowns=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Rule evaluation failed: {}", exc)
+            self._rule_summary_label.setText(f"Rule evaluation failed: {exc}")
+            self._rule_action_label.setStyleSheet("color: #c62828;")
+            self._rule_action_label.setText("")
+            self._persist_rule_snapshot(snapshot)
+            return
+
+        if match is None:
+            self._rule_summary_label.setText("No rules matched the current snapshot.")
+            self._rule_action_label.setStyleSheet("color: #555555;")
+            self._rule_action_label.setText("")
+        else:
+            description = match.rule.description or ""
+            detail = f"Matched rule: {match.rule.name}"
+            if description:
+                detail += f" — {description}"
+            self._rule_summary_label.setText(detail)
+            action_text = self._rule_engine.describe_action(match.action)
+            self._rule_action_label.setStyleSheet("color: #1b5e20; font-weight: 600;")
+            self._rule_action_label.setText(action_text)
+
+        self._persist_rule_snapshot(snapshot)
+
+    def _persist_rule_snapshot(self, snapshot: RuleSnapshot) -> None:
+        payload = self._serialize_rule_snapshot(snapshot)
+        try:
+            self._rule_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            self._rule_snapshot_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError as exc:  # noqa: BLE001
+            logger.debug("Unable to write rule snapshot to {}: {}", self._rule_snapshot_path, exc)
+
+    @staticmethod
+    def _serialize_rule_snapshot(snapshot: RuleSnapshot) -> Dict[str, Any]:
+        return {
+            "snippets": {
+                name: {"detected": obs.detected, "score": obs.score}
+                for name, obs in snapshot.snippets.items()
+            },
+            "state_values": dict(snapshot.state_values),
+            "scenario_current": snapshot.scenario_current,
+            "scenario_next": snapshot.scenario_next,
+            "player_state": snapshot.player_state,
+            "metadata": dict(snapshot.metadata),
+        }
+
     def _update_capture_state(self) -> None:
         has_device = self._current_serial is not None
         has_game = self._current_game is not None
@@ -1353,6 +1839,7 @@ class TrainTab(QWidget):
         self._populate_next_combo(self._next_scenario)
         self._store_scenario_history()
         self._update_capture_state()
+        self._update_rule_preview()
 
     def _on_next_scenario_changed(self, index: int) -> None:
         data = self._scenario_combo_next.itemData(index)
@@ -1360,6 +1847,7 @@ class TrainTab(QWidget):
         self._next_scenario = scenario
         self._store_scenario_history()
         self._update_capture_state()
+        self._update_rule_preview()
 
     def _on_manage_scenarios_clicked(self) -> None:
         self.scenario_manage_requested.emit()
@@ -1407,6 +1895,7 @@ class TrainTab(QWidget):
                 self._player_state_registry.add_state(value)
             self._current_player_state = value
         self._store_player_state_history()
+        self._update_rule_preview()
 
     def _on_manage_player_states_clicked(self) -> None:
         dialog = PlayerStateDialog(self._player_state_registry, self)
@@ -1744,6 +2233,15 @@ class TrainTab(QWidget):
         if self._last_screenshot_bytes:
             self._update_state_board_values(self._last_screenshot_bytes)
         self._refresh_gpu_support()
+        if self._policy_runner and self._policy_runner.is_ready:
+            self._policy_runner.to(self._policy_device())
+            if self._policy_model_path:
+                try:
+                    display_path = self._policy_model_path.relative_to(Path.cwd())
+                except ValueError:
+                    display_path = self._policy_model_path
+                self._policy_model_label.setText(f"{display_path} (device: {self._policy_device()})")
+        self._update_policy_controls()
 
     def _on_training_output_ready(self) -> None:
         if not self._training_process:
@@ -1776,6 +2274,231 @@ class TrainTab(QWidget):
         running = process is not None and process.state() != QProcess.ProcessState.NotRunning
         self._start_training_button.setEnabled(not running)
         self._stop_training_button.setEnabled(running)
+
+    # Policy control ----------------------------------------------------------
+
+    def _policy_device(self) -> str:
+        if self._use_gpu and torch is not None and torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+
+    def _ensure_policy_runner(self) -> PolicyRunner:
+        if self._policy_runner is None:
+            self._policy_runner = PolicyRunner(device=self._policy_device())
+        else:
+            self._policy_runner.to(self._policy_device())
+        return self._policy_runner
+
+    def _set_policy_status(self, message: str) -> None:
+        if hasattr(self, "_policy_status_label"):
+            self._policy_status_label.setText(message)
+
+    def _update_policy_controls(self) -> None:
+        if not hasattr(self, "_policy_load_button"):
+            return
+        has_torch = torch is not None
+        has_model = bool(self._policy_runner and self._policy_runner.is_ready)
+        self._policy_load_button.setEnabled(has_torch)
+        self._policy_unload_button.setEnabled(has_model)
+        allow_toggle = has_model and self._current_serial is not None
+        self._policy_toggle_button.setEnabled(allow_toggle)
+        if not allow_toggle and self._policy_toggle_button.isChecked():
+            self._policy_toggle_button.blockSignals(True)
+            self._policy_toggle_button.setChecked(False)
+            self._policy_toggle_button.blockSignals(False)
+            self._policy_enabled = False
+        self._policy_toggle_button.setText(
+            "Disable Policy Control" if self._policy_enabled else "Enable Policy Control"
+        )
+
+    def _on_load_policy_model_clicked(self) -> None:
+        if torch is None:
+            QMessageBox.warning(self, "Policy Model", "PyTorch is required to load policy checkpoints.")
+            return
+        start_dir = (
+            str(self._policy_model_path.parent)
+            if self._policy_model_path
+            else str(Path("models/policy").resolve())
+        )
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Policy Checkpoint",
+            start_dir,
+            "PyTorch models (*.pt *.pth);;All files (*)",
+        )
+        if not filename:
+            return
+        checkpoint_path = Path(filename)
+        metadata_path = checkpoint_path.with_name("policy_metadata.json")
+        if not metadata_path.exists():
+            meta_name, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Policy Metadata",
+                str(checkpoint_path.parent),
+                "JSON files (*.json);;All files (*)",
+            )
+            if not meta_name:
+                QMessageBox.warning(
+                    self,
+                    "Policy Model",
+                    "Metadata file is required to load the policy.",
+                )
+                return
+            metadata_path = Path(meta_name)
+        try:
+            runner = self._ensure_policy_runner()
+            runner.load(checkpoint_path, metadata_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to load policy model: {}", exc)
+            QMessageBox.critical(self, "Policy Model", f"Failed to load policy model:\n{exc}")
+            return
+
+        self._policy_model_path = checkpoint_path
+        self._policy_metadata_path = metadata_path
+        try:
+            display_path = checkpoint_path.relative_to(Path.cwd())
+        except ValueError:
+            display_path = checkpoint_path
+        self._policy_model_label.setText(f"{display_path} (device: {self._policy_device()})")
+        self._policy_enabled = False
+        self._policy_toggle_button.blockSignals(True)
+        self._policy_toggle_button.setChecked(False)
+        self._policy_toggle_button.blockSignals(False)
+        self._set_policy_status("Policy model loaded. Enable control to let it act.")
+        self._update_policy_controls()
+
+    def _on_unload_policy_model_clicked(self) -> None:
+        self._policy_runner = None
+        self._policy_model_path = None
+        self._policy_metadata_path = None
+        self._last_policy_prediction = None
+        self._policy_enabled = False
+        self._policy_model_label.setText("No checkpoint loaded.")
+        self._policy_toggle_button.blockSignals(True)
+        self._policy_toggle_button.setChecked(False)
+        self._policy_toggle_button.blockSignals(False)
+        self._set_policy_status("Policy model unloaded.")
+        self._update_policy_controls()
+
+    def _on_policy_toggle_changed(self, enabled: bool) -> None:
+        if not (self._policy_runner and self._policy_runner.is_ready):
+            QMessageBox.information(self, "Policy Control", "Load a policy checkpoint first.")
+            self._policy_toggle_button.blockSignals(True)
+            self._policy_toggle_button.setChecked(False)
+            self._policy_toggle_button.blockSignals(False)
+            return
+        if enabled and not self._current_serial:
+            QMessageBox.information(self, "Policy Control", "Select a connected device first.")
+            self._policy_toggle_button.blockSignals(True)
+            self._policy_toggle_button.setChecked(False)
+            self._policy_toggle_button.blockSignals(False)
+            return
+        self._policy_enabled = bool(enabled)
+        self._policy_toggle_button.setText(
+            "Disable Policy Control" if self._policy_enabled else "Enable Policy Control"
+        )
+        self._set_policy_status("Policy control enabled." if self._policy_enabled else "Policy control disabled.")
+
+    def _state_board_snapshot(self) -> Dict[str, str]:
+        if not self._state_board_captured:
+            return {}
+        return {name: ", ".join(values) for name, values in self._state_board_captured.items()}
+
+    def _maybe_run_policy_control(self, png_bytes: bytes) -> None:
+        if (
+            not self._policy_enabled
+            or self._policy_runner is None
+            or not self._policy_runner.is_ready
+            or torch is None
+        ):
+            return
+        if self._current_serial is None:
+            self._set_policy_status("Policy disabled: no device selected.")
+            return
+        if self._awaiting_tap or self._awaiting_swipe:
+            self._set_policy_status("Waiting for previous action to complete.")
+            return
+
+        try:
+            state_values = self.get_state_board_values() if self._state_board_captured else {}
+        except Exception:  # noqa: BLE001
+            state_values = self._state_board_snapshot()
+
+        try:
+            prediction = self._policy_runner.predict(
+                png_bytes=png_bytes,
+                state_board=state_values,
+                scenario_current=self._current_scenario,
+                scenario_next=self._next_scenario,
+                player_state=self._current_player_state,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Policy inference failed: {}", exc)
+            self._set_policy_status(f"Policy error: {exc}")
+            self._policy_toggle_button.blockSignals(True)
+            self._policy_toggle_button.setChecked(False)
+            self._policy_toggle_button.blockSignals(False)
+            self._policy_enabled = False
+            return
+
+        if prediction is None:
+            self._set_policy_status("Policy not ready.")
+            return
+
+        self._last_policy_prediction = prediction
+
+        confidence = prediction.confidence
+        threshold = float(self._policy_confidence_spin.value())
+        if confidence < threshold:
+            self._set_policy_status(f"Low confidence ({confidence:.2f} < {threshold:.2f}); skipping action.")
+            return
+
+        action = prediction.action
+        coords = prediction.coordinates
+        width, height = prediction.image_size
+
+        if action == "idle":
+            self._set_policy_status(f"Policy chose idle ({confidence:.2f}).")
+            return
+
+        def clamp01(value: float) -> float:
+            return max(0.0, min(1.0, float(value)))
+
+        if action == "tap":
+            x = int(round(clamp01(coords[0]) * width))
+            y = int(round(clamp01(coords[1]) * height))
+            if self._snippet_matches:
+                guess = self._guess_snippet_from_point((x, y))
+                if guess:
+                    self._set_auto_target_guess(guess)
+            self._awaiting_tap = True
+            self._click_position_label.setText(f"Policy tap raw=({x}, {y})")
+            self._status_label.setText(f"Policy sending tap to ({x}, {y}) on {self._current_device_label}…")
+            self._device_manager.send_tap(self._current_serial, x, y)
+            self._set_policy_status(f"Sent tap ({x}, {y}) (confidence {confidence:.2f}).")
+        elif action == "swipe":
+            x1 = int(round(clamp01(coords[0]) * width))
+            y1 = int(round(clamp01(coords[1]) * height))
+            x2 = int(round(clamp01(coords[2]) * width))
+            y2 = int(round(clamp01(coords[3]) * height))
+            duration_ms = max(50, int(round(max(0.0, coords[4]) * 1000.0)))
+            if self._snippet_matches:
+                guess = self._guess_snippet_from_point((x1, y1))
+                if guess:
+                    self._set_auto_target_guess(guess)
+            self._awaiting_swipe = True
+            self._click_position_label.setText(
+                f"Policy swipe raw=({x1}, {y1})→({x2}, {y2}) {duration_ms}ms"
+            )
+            self._status_label.setText(
+                f"Policy sending swipe ({x1}, {y1})→({x2}, {y2}) on {self._current_device_label}…"
+            )
+            self._device_manager.send_swipe(self._current_serial, x1, y1, x2, y2, duration_ms)
+            self._set_policy_status(
+                f"Sent swipe ({x1}, {y1})→({x2}, {y2}) (confidence {confidence:.2f})."
+            )
+        else:
+            self._set_policy_status(f"Policy action '{action}' is not supported.")
 
     def _scenario_suffix(self) -> str:
         if self._current_scenario and self._next_scenario:
@@ -2303,7 +3026,20 @@ class TrainTab(QWidget):
             cleaned = [text.strip() for text in texts if text and text.strip()]
             cleaned = self._apply_state_board_format(region, cleaned)
             if cleaned:
-                results[region.name].extend(cleaned)
+                format_hint = (getattr(region, "value_format", None) or "").strip().lower()
+                is_ratio_hint = format_hint.startswith("(") and format_hint.endswith(")")
+                if len(cleaned) > 1 and is_ratio_hint:
+                    quest_labels = [
+                        "first_quest",
+                        "second_quest",
+                        "third_quest",
+                        "fourth_quest",
+                    ]
+                    for idx, value in enumerate(cleaned):
+                        label = quest_labels[idx] if idx < len(quest_labels) else f"quest {idx + 1}"
+                        results[label].append(value)
+                else:
+                    results[region.name].extend(cleaned)
 
         if not results:
             self._set_state_board_message("No numeric values detected in State Boards.")
@@ -2356,7 +3092,11 @@ class TrainTab(QWidget):
         if "currency" in fmt_lower or "," in merged:
             digits_only = merged.replace(",", "")
             formatted_currency = self._format_integer_string(digits_only)
-            return [formatted_currency]
+            decimal_value = self._coerce_number(digits_only)
+            if decimal_value is not None:
+                return [f"{decimal_value:.0f}"]
+            numeric_fallback = "".join(ch for ch in digits_only if ch.isdigit())
+            return [numeric_fallback] if numeric_fallback else [formatted_currency]
 
         return [merged]
 
@@ -2391,6 +3131,7 @@ class TrainTab(QWidget):
         self._state_board_inputs.clear()
         self._state_board_captured.clear()
         self._clear_state_board_results()
+        self._update_rule_preview()
 
     def _clear_state_board_results(self) -> None:
         while self._state_board_results_layout.count():
@@ -2437,6 +3178,7 @@ class TrainTab(QWidget):
             self._state_board_inputs[name] = input_edit
 
         self._state_board_results_layout.addStretch(1)
+        self._update_rule_preview()
 
     def get_state_board_values(self) -> Dict[str, str]:
         collected: Dict[str, str] = {}

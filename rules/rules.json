@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "d4ef77d64ae7",
+      "name": "unlock_screen",
+      "description": "",
+      "priority": 0,
+      "cooldown_sec": 0.0,
+      "conditions": [
+        {
+          "tests": [
+            {
+              "type": "snippet_detected",
+              "name": "screen_lock"
+            }
+          ]
+        }
+      ],
+      "action": {
+        "type": "swipe",
+        "target_snippet": "screen_lock",
+        "coordinates": [
+          963,
+          630
+        ],
+        "end": [
+          963,
+          460
+        ],
+        "duration_ms": 550,
+        "swipe_style": "Down \u2192 Up"
+      }
+    }
+  ],
+  "scenario_actions": {
+    "Auto Moving": [
+      {
+        "type": "tap"
+      },
+      {
+        "type": "tap"
+      }
+    ],
+    "Reseting to Auto Questing": [
+      {
+        "type": "tap"
+      }
+    ]
+  }
+}

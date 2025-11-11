@@ -4,8 +4,18 @@ from .adb_client import AdbClient, DeviceInfo
 from .device_manager import DeviceManager
 from .game_registry import GameConfig, GameRegistry
 from .layout_registry import LayoutRegistry, RegionConfig
-from .scenario_registry import ScenarioRegistry
 from .player_state_registry import PlayerStateRegistry
+from .policy_runner import PolicyRunner, PolicyActionPrediction
+from .rule_engine import (
+    ConditionGroup,
+    RuleAction,
+    RuleDefinition,
+    RuleEngine,
+    RuleMatch,
+    RuleSnapshot,
+    SnippetObservation,
+)
+from .scenario_registry import ScenarioRegistry
 from .training_sample import ActionRecord, TrainingSample, TrainingSampleLogger
 
 __all__ = [
@@ -16,8 +26,17 @@ __all__ = [
     "GameRegistry",
     "LayoutRegistry",
     "RegionConfig",
-    "ScenarioRegistry",
+    "PolicyRunner",
+    "PolicyActionPrediction",
     "PlayerStateRegistry",
+    "ScenarioRegistry",
+    "RuleEngine",
+    "RuleSnapshot",
+    "RuleMatch",
+    "RuleAction",
+    "RuleDefinition",
+    "ConditionGroup",
+    "SnippetObservation",
     "ActionRecord",
     "TrainingSample",
     "TrainingSampleLogger",

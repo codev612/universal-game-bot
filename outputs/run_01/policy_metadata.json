@@ -1,0 +1,34 @@
+{
+  "scenario_to_index": {
+    "<none>": 0,
+    "Auto Questing": 1,
+    "Go to next questing": 2,
+    "Going to gludin village": 3,
+    "Loading": 4,
+    "Purchasing blood": 5,
+    "Quest Ended": 6,
+    "Reseting to Auto Questing": 7,
+    "Screen Locking": 8,
+    "Starting": 9,
+    "Teleporting": 10,
+    "Unlock screen": 11,
+    "Waiting for recharge blood": 12
+  },
+  "player_state_to_index": {
+    "<none>": 0,
+    "Dead": 1,
+    "Low blood": 2,
+    "No moving": 3,
+    "No progressing": 4,
+    "Normal": 5
+  },
+  "state_keys": [
+    "bag weight",
+    "coins",
+    "estimated weight",
+    "first_quest",
+    "level",
+    "mp_board",
+    "second_quest"
+  ]
+}
