@@ -1225,6 +1225,18 @@ class _ConditionGroupDialog(QDialog):
         if changed:
             self._snippet_names = sorted(updated, key=str.lower)
 
+    def _merge_snippet_swipes(self, swipes: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]) -> None:
+        if not swipes:
+            return
+        updated = dict(self._snippet_swipes)
+        changed = False
+        for name, swipe in swipes.items():
+            if name and swipe and name not in updated:
+                updated[name] = swipe
+                changed = True
+        if changed:
+            self._snippet_swipes = dict(sorted(updated.items(), key=lambda item: item[0].lower()))
+
 
 class _TestEditorDialog(QDialog):
     """Dialog for adding/editing a single test."""
@@ -1423,6 +1435,36 @@ class _TestEditorDialog(QDialog):
 
         self.test_data = data
         self.accept()
+
+    def collect_snippet_names(self) -> List[str]:
+        """Collect snippet names used in this test."""
+        names = set()
+        if hasattr(self, 'test_data') and self.test_data:
+            name = self.test_data.get("name")
+            if isinstance(name, str) and name:
+                names.add(name)
+        return sorted(names, key=str.lower)
+
+    def collect_snippet_positions(self) -> Dict[str, Tuple[int, int, int, int]]:
+        """Collect snippet positions from this test."""
+        positions: Dict[str, Tuple[int, int, int, int]] = {}
+        if hasattr(self, 'test_data') and self.test_data:
+            if not self.test_data.get("_use_rect"):
+                return positions
+            name = self.test_data.get("name")
+            rect = self.test_data.get("_rect")
+            if (
+                isinstance(name, str)
+                and name
+                and isinstance(rect, (list, tuple))
+                and len(rect) == 4
+            ):
+                try:
+                    x, y, w, h = (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+                    positions[name] = (x, y, w, h)
+                except (TypeError, ValueError):
+                    pass
+        return positions
 
     def collect_snippet_swipes(self) -> Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]:
         return {}

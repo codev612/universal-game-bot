@@ -1,6 +1,113 @@
 {
-  "snippets": {},
-  "state_values": {},
+  "snippets": {
+    "quest_run_button": {
+      "detected": false,
+      "score": null
+    },
+    "short_button": {
+      "detected": false,
+      "score": null
+    },
+    "confirm_black": {
+      "detected": false,
+      "score": null
+    },
+    "do_not_show": {
+      "detected": false,
+      "score": null
+    },
+    "go_button": {
+      "detected": false,
+      "score": null
+    },
+    "merchant_button": {
+      "detected": false,
+      "score": null
+    },
+    "confirm_yellow": {
+      "detected": false,
+      "score": null
+    },
+    "skip_button": {
+      "detected": false,
+      "score": null
+    },
+    "claim_reward_button": {
+      "detected": false,
+      "score": null
+    },
+    "accept_button": {
+      "detected": false,
+      "score": null
+    },
+    "close_button": {
+      "detected": false,
+      "score": null
+    },
+    "teleport_button": {
+      "detected": false,
+      "score": null
+    },
+    "back_button": {
+      "detected": false,
+      "score": null
+    },
+    "gludin_village": {
+      "detected": false,
+      "score": null
+    },
+    "general_merchant_button": {
+      "detected": false,
+      "score": null
+    },
+    "gear_merchant": {
+      "detected": false,
+      "score": null
+    },
+    "map_title": {
+      "detected": false,
+      "score": null
+    },
+    "screen_lock": {
+      "detected": true,
+      "score": 1.0
+    },
+    "health_potion_bound": {
+      "detected": false,
+      "score": null
+    },
+    "confirm_purchase": {
+      "detected": false,
+      "score": null
+    },
+    "purchase_num_10": {
+      "detected": false,
+      "score": null
+    },
+    "purchase_num_100": {
+      "detected": false,
+      "score": null
+    },
+    "purchase_num_1000": {
+      "detected": false,
+      "score": null
+    },
+    "general_merchant_title": {
+      "detected": false,
+      "score": null
+    },
+    "enter_to_play": {
+      "detected": false,
+      "score": null
+    },
+    "tap_screen_to_enter": {
+      "detected": false,
+      "score": null
+    }
+  },
+  "state_values": {
+    "mp_board": "1.0000"
+  },
   "scenario_current": null,
   "scenario_next": null,
   "player_state": null,
