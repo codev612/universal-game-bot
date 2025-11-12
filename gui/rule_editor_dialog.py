@@ -1277,6 +1277,9 @@ class _TestEditorDialog(QDialog):
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
+        
+        # Store form row references for proper visibility handling
+        self._form_rows: Dict[QWidget, Tuple[QWidget, QWidget]] = {}
 
         self._kind_combo = QComboBox()
         self._kind_combo.addItems(list(self._TEST_KIND_LABELS.keys()))
@@ -1292,42 +1295,42 @@ class _TestEditorDialog(QDialog):
             self._snippet_name_combo.addItem(snippet_initial)
         self._snippet_name_combo.setCurrentText(snippet_initial)
         self._snippet_name_combo.currentTextChanged.connect(self._on_snippet_changed)
-        form.addRow("Snippet name:", self._snippet_name_combo)
+        self._add_form_row(form, "Snippet name:", self._snippet_name_combo)
 
         self._use_rect_checkbox = QCheckBox("Use snippet centroid for coordinates")
         self._use_rect_checkbox.setChecked(bool(initial.get("_use_rect")))
-        form.addRow("", self._use_rect_checkbox)
+        self._add_form_row(form, "", self._use_rect_checkbox)
 
         self._state_name_edit = QLineEdit(initial.get("name", ""))
-        form.addRow("State name:", self._state_name_edit)
+        self._add_form_row(form, "State name:", self._state_name_edit)
 
         self._value_edit = QLineEdit(str(initial.get("value", "")))
-        form.addRow("Value:", self._value_edit)
+        self._add_form_row(form, "Value:", self._value_edit)
 
         self._threshold_spin = QDoubleSpinBox()
         self._threshold_spin.setRange(-1_000_000.0, 1_000_000.0)
         self._threshold_spin.setDecimals(4)
         self._threshold_spin.setValue(float(initial.get("threshold", 0.0)))
-        form.addRow("Threshold:", self._threshold_spin)
+        self._add_form_row(form, "Threshold:", self._threshold_spin)
 
         self._min_spin = QDoubleSpinBox()
         self._min_spin.setRange(-1_000_000.0, 1_000_000.0)
         self._min_spin.setDecimals(4)
         self._min_spin.setValue(float(initial.get("min", 0.0)))
-        form.addRow("Min value:", self._min_spin)
+        self._add_form_row(form, "Min value:", self._min_spin)
 
         self._max_spin = QDoubleSpinBox()
         self._max_spin.setRange(-1_000_000.0, 1_000_000.0)
         self._max_spin.setDecimals(4)
         self._max_spin.setValue(float(initial.get("max", 0.0)))
-        form.addRow("Max value:", self._max_spin)
+        self._add_form_row(form, "Max value:", self._max_spin)
 
         self._expression_edit = QTextEdit(initial.get("expression", ""))
         self._expression_edit.setPlaceholderText(
             "Expression using helpers like detected('Snippet'), score('Snippet'),\n"
             "state_float('Health') < 0.5, player_state() == 'low blood', etc."
         )
-        form.addRow("Expression:", self._expression_edit)
+        self._add_form_row(form, "Expression:", self._expression_edit)
 
         layout.addLayout(form)
 
@@ -1338,6 +1341,16 @@ class _TestEditorDialog(QDialog):
 
         self.test_data: Dict[str, Any] = dict(initial)
         self._update_field_visibility(kind)
+
+    def _add_form_row(self, form: QFormLayout, label_text: str, widget: QWidget) -> None:
+        """Add a form row and track its label for visibility management."""
+        if label_text:
+            label = QLabel(label_text)
+            form.addRow(label, widget)
+            self._form_rows[widget] = (label, widget)
+        else:
+            form.addRow(widget)
+            self._form_rows[widget] = (None, widget)
 
     def _update_field_visibility(self, kind: str) -> None:
         snippet_fields = kind.startswith("snippet")
@@ -1366,12 +1379,15 @@ class _TestEditorDialog(QDialog):
         self._expression_edit.setVisible(kind == "custom_expression")
         self._use_rect_checkbox.setVisible(snippet_fields)
 
-    @staticmethod
-    def _set_row_visible(widget: QWidget, visible: bool) -> None:
-        parent = widget.parentWidget()
-        if parent is not None:
-            parent.setVisible(visible)
-        widget.setVisible(visible)
+    def _set_row_visible(self, widget: QWidget, visible: bool) -> None:
+        """Set visibility of a form row (both label and widget)."""
+        if widget in self._form_rows:
+            label, field = self._form_rows[widget]
+            field.setVisible(visible)
+            if label is not None:
+                label.setVisible(visible)
+        else:
+            widget.setVisible(visible)
 
     def _populate_snippet_combo(self) -> None:
         self._snippet_name_combo.blockSignals(True)
@@ -1480,6 +1496,7 @@ class _ActionEditorDialog(QDialog):
         scenario_mode: bool = False,
         snippet_names: Optional[List[str]] = None,
         snippet_positions: Optional[Dict[str, Tuple[int, int, int, int]]] = None,
+        snippet_swipes: Optional[Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit Action")

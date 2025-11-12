@@ -63,6 +63,21 @@
           532
         ]
       }
+    },
+    {
+      "id": "e9cbe2b5129f",
+      "name": "New Rule",
+      "description": "",
+      "priority": 0,
+      "cooldown_sec": 0.0,
+      "conditions": [
+        {
+          "tests": []
+        }
+      ],
+      "action": {
+        "type": "tap"
+      }
     }
   ],
   "scenario_actions": {

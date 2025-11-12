@@ -5,3 +5,7 @@ loguru>=0.7
 Pillow>=9.0
 torch>=2.0,<2.6; platform_system=="Windows"
 
+# GPU acceleration (optional)
+cupy-cuda11x>=12.0; platform_system=="Windows" and platform_machine=="AMD64"
+opencv-contrib-python>=4.8.0
+

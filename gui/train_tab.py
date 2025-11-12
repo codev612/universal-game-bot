@@ -34,6 +34,9 @@ from PyQt6.QtWidgets import (
 )
 from loguru import logger
 
+from core.gpu_manager import get_gpu_manager, is_gpu_available
+from core.gpu_image_processor import get_gpu_image_processor
+
 easyocr = None
 Image = ImageEnhance = ImageFilter = ImageOps = None
 torch = None
@@ -182,7 +185,7 @@ class TrainTab(QWidget):
         self._last_screenshot_bytes: Optional[bytes] = None
         self._awaiting_tap: bool = False
         self._awaiting_swipe: bool = False
-        self._ocr_reader: Optional["easyocr.Reader"] = None
+        self._ocr_reader: Optional[Any] = None
         self._ocr_enabled: bool = True
         self._state_board_inputs: Dict[str, QLineEdit] = {}
         self._state_board_captured: Dict[str, List[str]] = {}
@@ -195,6 +198,13 @@ class TrainTab(QWidget):
             self._detection_thresholds,
             self._color_tolerance_default,
         ) = self._load_detection_config()
+        
+        # Initialize GPU acceleration
+        self._gpu_manager = get_gpu_manager()
+        self._gpu_processor = get_gpu_image_processor()
+        self._gpu_enabled = is_gpu_available()
+        logger.info("GPU acceleration enabled: {}", self._gpu_enabled)
+        
         try:
             self._orb_detector = cv2.ORB_create()
             self._bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
@@ -241,9 +251,11 @@ class TrainTab(QWidget):
 
         self._device_value = QLabel(self._current_device_label)
         self._game_value = QLabel("No game selected")
+        self._gpu_status_value = QLabel("Checking...")
 
         info_form.addRow("Device:", self._device_value)
         info_form.addRow("Game:", self._game_value)
+        info_form.addRow("GPU Acceleration:", self._gpu_status_value)
 
         scenario_row_widget = QWidget()
         scenario_row_layout = QHBoxLayout(scenario_row_widget)
@@ -933,8 +945,14 @@ class TrainTab(QWidget):
         self._snippet_mask_cache[key] = mask
         return mask
 
-    @staticmethod
-    def _generate_snippet_mask(snippet_color: np.ndarray) -> Optional[np.ndarray]:
+    def _generate_snippet_mask(self, snippet_color: np.ndarray) -> Optional[np.ndarray]:
+        # Try GPU-accelerated mask creation first
+        if self._gpu_enabled:
+            mask = self._gpu_processor.create_snippet_mask(snippet_color, method="combined")
+            if mask is not None:
+                return mask
+        
+        # Fallback to original CPU implementation
         try:
             gray = cv2.cvtColor(snippet_color, cv2.COLOR_BGR2GRAY)
         except cv2.error:
@@ -2063,6 +2081,28 @@ class TrainTab(QWidget):
         self._preview_label.resize(scaled.size())
 
     def _refresh_gpu_support(self) -> None:
+        """Update GPU acceleration status display."""
+        if hasattr(self, '_gpu_status_value'):
+            gpu_info = self._gpu_processor.get_processing_stats()
+            status_parts = []
+            
+            if gpu_info["cuda_available"]:
+                status_parts.append("CUDA")
+            if gpu_info["opencv_cuda_available"]:
+                status_parts.append("OpenCV-CUDA")
+            if gpu_info["cupy_available"]:
+                status_parts.append("CuPy")
+                
+            if status_parts:
+                gpu_name = gpu_info.get("gpu_name", "Unknown")
+                memory_gb = gpu_info.get("gpu_memory_gb", 0)
+                status_text = f"{', '.join(status_parts)} ({gpu_name}, {memory_gb:.1f}GB)"
+            else:
+                status_text = "CPU Only"
+                
+            self._gpu_status_value.setText(status_text)
+        
+    def _original_refresh_gpu_support(self) -> None:
         _lazy_imports()
         info_parts: List[str] = []
         available = False
@@ -2652,6 +2692,17 @@ class TrainTab(QWidget):
         sh, sw = snippet_gray.shape[:2]
         if roi_gray.shape[0] < sh or roi_gray.shape[1] < sw:
             return None
+            
+        # Try GPU acceleration first
+        if self._gpu_enabled:
+            result = self._gpu_processor.template_match_gpu(roi_gray, snippet_gray, threshold, mask)
+            if result is not None:
+                # Adjust coordinates to global position
+                result["x"] += origin_x
+                result["y"] += origin_y
+                return result
+        
+        # Fallback to original CPU implementation
         method = cv2.TM_CCORR_NORMED if mask is not None else cv2.TM_CCOEFF_NORMED
         try:
             if mask is None and self._use_gpu and self._cuda_available:
@@ -2660,15 +2711,15 @@ class TrainTab(QWidget):
                 roi_gpu.upload(roi_gray)
                 tmpl_gpu.upload(snippet_gray)
                 res_gpu = cv2.cuda.matchTemplate(roi_gpu, tmpl_gpu, method)
-                result = res_gpu.download()
+                result_img = res_gpu.download()
             else:
                 raise AttributeError
         except Exception:
             if mask is not None:
-                result = cv2.matchTemplate(roi_gray, snippet_gray, method, mask=mask)
+                result_img = cv2.matchTemplate(roi_gray, snippet_gray, method, mask=mask)
             else:
-                result = cv2.matchTemplate(roi_gray, snippet_gray, method)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                result_img = cv2.matchTemplate(roi_gray, snippet_gray, method)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result_img)
         if max_val >= threshold:
             x = origin_x + max_loc[0]
             y = origin_y + max_loc[1]
@@ -2684,6 +2735,20 @@ class TrainTab(QWidget):
         threshold: float,
         mask: Optional[np.ndarray] = None,
     ) -> Optional[dict]:
+        # Try GPU-accelerated multiscale matching first
+        if self._gpu_enabled:
+            result = self._gpu_processor.multiscale_template_match_gpu(
+                roi_gray, snippet_gray, threshold, 
+                scales=[0.8, 0.9, 1.0, 1.1, 1.2], 
+                mask=mask
+            )
+            if result is not None:
+                # Adjust coordinates to global position
+                result["x"] += origin_x
+                result["y"] += origin_y
+                return result
+        
+        # Fallback to original CPU implementation
         sh, sw = snippet_gray.shape[:2]
         best = None
         best_val = -1.0
@@ -2735,10 +2800,19 @@ class TrainTab(QWidget):
     ) -> Optional[dict]:
         if self._orb_detector is None or self._bf_matcher is None:
             return None
-        kp1, des1 = self._orb_detector.detectAndCompute(snippet_gray, None)
+            
+        # Enhance images for better feature detection
+        if self._gpu_enabled:
+            enhanced_snippet = self._gpu_processor.enhance_for_feature_detection(snippet_gray)
+            enhanced_roi = self._gpu_processor.enhance_for_feature_detection(roi_gray)
+        else:
+            enhanced_snippet = snippet_gray
+            enhanced_roi = roi_gray
+            
+        kp1, des1 = self._orb_detector.detectAndCompute(enhanced_snippet, None)
         if des1 is None or len(kp1) < 4:
             return None
-        kp2, des2 = self._orb_detector.detectAndCompute(roi_gray, None)
+        kp2, des2 = self._orb_detector.detectAndCompute(enhanced_roi, None)
         if des2 is None or len(kp2) < 4:
             return None
 
@@ -3013,9 +3087,16 @@ class TrainTab(QWidget):
 
             region_image = image.crop(box)
             np_region = np.array(region_image)
+            
+            # Preprocess image for better OCR results with GPU acceleration
+            if self._gpu_enabled and np_region.size > 0:
+                enhanced_region = self._gpu_processor.preprocess_for_ocr(np_region, enhance=True)
+            else:
+                enhanced_region = np_region
+                
             try:
                 texts = reader.readtext(
-                    np_region,
+                    enhanced_region,
                     detail=0,
                     allowlist="0123456789.,/()%+-",
                 )
@@ -3191,7 +3272,7 @@ class TrainTab(QWidget):
                 collected[name] = ", ".join(captured_values)
         return collected
 
-    def _get_ocr_reader(self) -> Optional["easyocr.Reader"]:
+    def _get_ocr_reader(self) -> Optional[Any]:
         if easyocr is None:
             return None
 
@@ -3199,15 +3280,21 @@ class TrainTab(QWidget):
             return self._ocr_reader
 
         try:
+            # Use GPU manager for optimal EasyOCR configuration
             try:
-                self._ocr_reader = easyocr.Reader(["en"], gpu=self._use_gpu)
+                self._ocr_reader = self._gpu_manager.create_easyocr_reader(["en"])
             except Exception as exc:  # noqa: BLE001
-                logger.warning("EasyOCR GPU init failed (gpu=%s): %s", self._use_gpu, exc)
-                if self._use_gpu:
-                    QMessageBox.warning(
-                        self,
-                        "EasyOCR",
-                        "Failed to initialize EasyOCR with GPU. Falling back to CPU.",
+                logger.warning("EasyOCR GPU init failed: %s", exc)
+                # Fallback to direct creation
+                try:
+                    self._ocr_reader = easyocr.Reader(["en"], gpu=self._use_gpu)
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning("EasyOCR CPU fallback failed: %s", exc2)
+                    if self._use_gpu:
+                        QMessageBox.warning(
+                            self,
+                            "EasyOCR",
+                            "Failed to initialize EasyOCR with GPU. Falling back to CPU.",
                     )
                     self._use_gpu = False
                     self._gpu_checkbox.blockSignals(True)
